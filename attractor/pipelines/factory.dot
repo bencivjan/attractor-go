@@ -1,4 +1,10 @@
-// Factory Pipeline
+// Factory Pipeline — Reference Diagram
+//
+// NOTE: This DOT file is a reference diagram showing the logical flow of the
+// combined developer + evaluator pipeline. Actual execution uses FactoryRunner
+// (attractor/factory), which runs developer.dot and evaluator.dot as separate,
+// context-isolated pipeline executions. Only explicitly defined context keys
+// cross the boundary between the two pipelines.
 //
 // The combined end-to-end pipeline that wires the developer and evaluator
 // pipelines together. The developer plans, implements, and QA-verifies code;

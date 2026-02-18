@@ -67,7 +67,7 @@ digraph plan_build_verify {
     // -----------------------------------------------------------------------
     implement [
         label       = "Implement Code"
-        prompt      = "You are a senior software engineer. Implement the sprint plans from context as production-ready code.\n\nFor each sprint:\n1. Write clean, idiomatic code that satisfies every acceptance criterion\n2. Include unit tests for all public interfaces\n3. Follow the architecture and patterns from the high-level plan\n4. Add brief inline comments only where the logic is non-obvious\n5. Handle errors properly at system boundaries\n\nOutput all code files with their full paths. Do not skip any sprint."
+        prompt      = "You are a senior software engineer. Implement the sprint plans from context as production-ready code.\n\nIf evaluator feedback is present in context as $evaluator_feedback, address every issue the evaluator raised before proceeding with the sprint plans. The evaluator's feedback takes priority — fix the identified problems first, then continue with any remaining sprint work.\n\nFor each sprint:\n1. Write clean, idiomatic code that satisfies every acceptance criterion\n2. Include unit tests for all public interfaces\n3. Follow the architecture and patterns from the high-level plan\n4. Add brief inline comments only where the logic is non-obvious\n5. Handle errors properly at system boundaries\n\nOutput all code files with their full paths. Do not skip any sprint."
         model       = "gpt-5.3-codex"
         llm_provider = "openai"
         goal_gate   = "true"

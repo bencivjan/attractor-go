@@ -215,5 +215,5 @@ digraph factory {
     eval_visionary -> exit              [condition="outcome=success",          label="Approved",          weight="10"]
     eval_visionary -> exit              [condition="outcome=partial_success",  label="Approved (partial)", weight="5"]
     eval_visionary -> eval_orchestrator [condition="outcome=retry",            label="Refine Evaluation",  weight="10"]
-    eval_visionary -> implement         [condition="outcome=fail",             label="Rejected",          weight="10", loop_restart="true"]
+    eval_visionary -> implement         [condition="outcome=fail",             label="Rejected",          weight="10"]
 }

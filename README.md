@@ -26,6 +26,10 @@ See [`evaluator_pipeline.md`](attractor/pipelines/evaluator_pipeline.md) for a d
 
 The end-to-end pipeline that wires the developer and evaluator together. After the developer's QA passes, the code hands off directly to the evaluator's orchestrator. If the evaluator's visionary rejects the submission, feedback routes back to the developer's implementation stage with the rejection context so Codex can address the issues. The evaluator's internal retry loop (visionary → orchestrator) remains for insufficient evaluations.
 
+The two phases are run by **separate orchestrator agents**. The developer agent owns planning through QA (stages 1–4); a distinct evaluator agent takes over for stages 5–8. This ensures the evaluator has no shared state or bias from the developer's execution context — it receives only the submitted artifacts and the project vision.
+
+Code-producing stages (`implement`, `eval_builder`) use **Codex 5.3** (`gpt-5.3-codex`). All reasoning, planning, review, and judgment stages use **Claude Opus** (`claude-opus-4-6`).
+
 ![Factory Pipeline](attractor/pipelines/factory.png)
 
 ## Why Go

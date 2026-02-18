@@ -14,6 +14,12 @@ The evaluator pipeline solves both problems by separating concerns into four rol
 
 The feedback loop between the visionary and orchestrator adds a critical layer: the visionary doesn't just judge the submission, it also judges the evaluation. If the orchestrator asked the wrong questions, built the wrong tools, or missed critical dimensions, the visionary sends the orchestrator back to try again with specific guidance on what to fix. This prevents the pipeline from rejecting good work due to a bad evaluation, or approving bad work because the tests didn't cover what matters.
 
+## Orchestration
+
+In the combined [factory pipeline](../../README.md#factory-combined), the evaluator phase is kicked off and run by a **completely separate orchestrator agent** from the developer phase. The evaluator agent receives only the submitted artifacts and the project vision — it has no access to the developer's internal planning, retry history, or execution context. This separation prevents bias and ensures the evaluation is independent.
+
+The builder stage (`eval_builder`) uses **Codex 5.3** (`gpt-5.3-codex`) for tool/harness construction. All other stages — orchestrator, QA, and visionary — use **Claude Opus** (`claude-opus-4-6`) for reasoning and judgment.
+
 ## Communication nodes
 
 The evaluator pipeline includes two **communication nodes** (shape=`doubleoctagon`) that mark where it connects to the developer pipeline:

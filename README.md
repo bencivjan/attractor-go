@@ -4,6 +4,24 @@ A production-grade Go implementation of the [Attractor specification](https://gi
 
 Attractor lets you define complex LLM pipelines as directed graphs in Graphviz DOT syntax. Nodes are tasks (LLM calls, human gates, parallel fan-outs), edges are transitions with conditions and weights, and the engine handles traversal, retries, checkpointing, and human interaction. This implementation covers the full spec and pairs it with a unified LLM client and coding agent runtime.
 
+## Pipelines
+
+Two pipelines ship out of the box. Both are defined as `.dot` files in `attractor/pipelines/` — the same declarative format the engine parses and executes. They demonstrate how DOT graphs compose LLM stages with conditional routing, goal gates, and feedback loops.
+
+### Plan-Build-Verify
+
+A software development pipeline that plans, implements, and verifies a feature. Claude Opus handles planning and QA; Codex writes the code. When QA fails, the pipeline loops back to implementation with the failure details in context, so Codex can fix the issues without re-planning from scratch.
+
+![Plan-Build-Verify Pipeline](attractor/pipelines/developer.png)
+
+### Evaluator
+
+An evaluation pipeline that reviews submissions against a project vision. Four role-separated agents — orchestrator, builder, QA, visionary — decompose the evaluation the way a human team would. The visionary can loop back to the orchestrator when the evaluation itself was insufficient (wrong tools, missing checks), triggering a refined delegation plan and a full re-run of builder and QA.
+
+![Evaluator Pipeline](attractor/pipelines/evaluator.png)
+
+See [`evaluator.md`](attractor/pipelines/evaluator.md) for a detailed walkthrough of the evaluator's stages and feedback loop.
+
 ## Why Go
 
 Go is the right language for a pipeline orchestrator. The properties that matter most — deterministic concurrency, fast startup, static binaries, and a type system that catches structural errors at compile time — are exactly what Go provides without ceremony.
@@ -90,16 +108,6 @@ Key capabilities:
 - **Structured output** — `GenerateObject()` validates responses against JSON schemas with fallback markdown fence extraction.
 - **Middleware** — Onion-pattern request/response interceptors for logging, metrics, or request modification.
 - **Unified types** — Messages, content blocks (text, image, audio, document, tool calls, thinking), and usage tracking work identically across providers.
-
-## Included Pipelines
-
-### Plan-Build-Verify (`developer.dot`)
-
-A four-stage software development pipeline: high-level planning (Claude Opus) → sprint breakdown (Claude Opus) → implementation (Codex) → QA verification (Claude Opus). QA failure loops back to implementation with feedback. Goal gates ensure quality before exit.
-
-### Evaluator (`evaluator.dot`)
-
-A four-stage evaluation pipeline for reviewing submissions against a project vision: orchestration (Claude Opus) → tool building (Codex) → QA testing (Claude Opus) → visionary judgment (Claude Opus). The visionary maintains the high-level goal and returns structured, actionable feedback to the submitter.
 
 ## Spec Compliance
 

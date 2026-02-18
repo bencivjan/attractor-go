@@ -1,163 +1,181 @@
 # attractor-go
 
-A production-grade Go implementation of the [Attractor specification](https://github.com/strongdm/attractor) — a DOT-based pipeline runner for orchestrating multi-stage AI workflows.
+A Go pipeline engine that runs multi-stage AI workflows defined as Graphviz DOT graphs. Nodes are tasks, edges are transitions with conditions and weights, and the engine handles traversal, retries, checkpointing, and context management.
 
-Attractor lets you define complex LLM pipelines as directed graphs in Graphviz DOT syntax. Nodes are tasks (LLM calls, human gates, parallel fan-outs), edges are transitions with conditions and weights, and the engine handles traversal, retries, checkpointing, and human interaction. This implementation covers the full spec and pairs it with a unified LLM client and coding agent runtime.
+## Quick start
 
-## Pipelines
+```go
+// Run a single pipeline from DOT source
+runner := engine.NewRunner(registry)
+outcome, err := runner.RunDOT(ctx, dotSource, "/path/to/logs")
 
-Three pipelines ship out of the box. All are defined as `.dot` files in `attractor/pipelines/` — the same declarative format the engine parses and executes. They demonstrate how DOT graphs compose LLM stages with conditional routing, goal gates, and feedback loops.
+// Run the factory (developer + evaluator with context isolation)
+f := &factory.FactoryRunner{
+    Registry:      registry,
+    MaxRejections: 3,
+}
+outcome, err := f.RunWithGoal(ctx, "build a feature", "/path/to/logs")
+```
 
-### Plan-Build-Verify (Developer)
+## Core concepts
 
-A software development pipeline that plans, implements, and verifies a feature. Claude Opus handles planning and QA; Codex writes the code. When QA fails, the pipeline loops back to implementation with the failure details in context. Communication nodes mark where the evaluator can take over (outbound) and where evaluator rejection feedback enters (inbound).
+**Graph**: A directed graph parsed from DOT syntax. Nodes have attributes (`shape`, `type`, `prompt`, `goal_gate`, `max_retries`). Edges have attributes (`condition`, `weight`, `label`, `loop_restart`).
 
-![Plan-Build-Verify Pipeline](attractor/pipelines/developer.png)
+**Handler**: Executes a node. Implements `Execute(ctx, node, pctx, graph, logsRoot) (*Outcome, error)`. The registry maps node types to handlers:
 
-### Evaluator
+| Shape | Type | Handler | Purpose |
+|-------|------|---------|---------|
+| `Mdiamond` | `start` | StartHandler | Pipeline entry, no-op |
+| `Msquare` | `exit` | ExitHandler | Pipeline exit, no-op |
+| `box` | `codergen` | CodergenHandler | LLM code generation |
+| `hexagon` | `wait.human` | WaitForHumanHandler | Human gate |
+| `diamond` | `conditional` | ConditionalHandler | Routing point, no-op |
+| `component` | `parallel` | ParallelHandler | Concurrent fan-out |
+| `tripleoctagon` | `parallel.fan_in` | FanInHandler | Aggregate parallel results |
+| `parallelogram` | `tool` | ToolHandler | Shell command execution |
+| `house` | `stack.manager_loop` | StackManagerLoopHandler | Loop counter |
+| `doubleoctagon` | `communication` | CommunicationHandler | Inter-pipeline boundary |
 
-An evaluation pipeline that reviews submissions against a project vision. Four role-separated agents — orchestrator, builder, QA, visionary — decompose the evaluation the way a human team would. The visionary can loop back to the orchestrator when the evaluation itself was insufficient. Communication nodes mark where developer output enters (inbound) and where rejection feedback exits (outbound).
+**Context** (`state.Context`): Thread-safe key-value store shared across nodes within a single pipeline run. `Set(key, value)`, `Get(key)`, `Snapshot()`, `Clone()`, `Clear()`.
 
-![Evaluator Pipeline](attractor/pipelines/evaluator.png)
+**Outcome** (`state.Outcome`): Returned by handlers. Contains `Status` (success/fail/retry/partial_success), `ContextUpdates`, `PreferredLabel`, `SuggestedNextIDs`, `FailureReason`.
 
-See [`evaluator_pipeline.md`](attractor/pipelines/evaluator_pipeline.md) for a detailed walkthrough of the evaluator's stages and feedback loop.
+**Edge selection**: After each node, the engine picks the next edge in strict priority: (1) condition match against outcome/context, (2) preferred label, (3) suggested next IDs, (4) highest weight, (5) lexical tiebreak.
 
-### Factory (Combined)
-
-The end-to-end pipeline that wires the developer and evaluator together. `FactoryRunner` (`attractor/factory`) orchestrates this by running `developer.dot` and `evaluator.dot` as **completely separate pipeline executions** — each gets a fresh `state.Context` with no shared state.
-
-**Context isolation**: Only two keys cross the developer-to-evaluator boundary: `goal` and `last_response`. The evaluator never sees the developer's planning notes, `status.*` keys, retry history, or internal state. On rejection, only `evaluator_feedback` (mapped from the evaluator's `last_response`) crosses back to the developer.
+## Pipeline execution lifecycle
 
 ```
-FactoryRunner.RunWithGoal()
+DOT source → Parse → Transform → Validate → Execute → Checkpoint
+```
+
+1. **Parse** — DOT text → `*graph.Graph` with nodes, edges, attributes
+2. **Transform** — Variable expansion (`$goal`), stylesheet application
+3. **Validate** — 13 lint rules (start/exit nodes exist, reachability, condition syntax, retry targets)
+4. **Execute** — Walk nodes start→exit, run handlers, select edges, retry on failure
+5. **Checkpoint** — Atomic save after each node for crash recovery
+
+Each `RunDOT` call creates a **fresh** `state.Context`. Graph attributes are mirrored in, then `InitialContext` (if set) is applied. No state carries over between separate `RunDOT` calls.
+
+## Factory pipeline
+
+`FactoryRunner` runs `developer.dot` and `evaluator.dot` as separate, context-isolated pipelines:
+
+```
+FactoryRunner.RunWithGoal(goal)
   │
   for each iteration (up to MaxRejections):
   │
   ├─ RunDOT(developer.dot)  ← fresh context + goal [+ evaluator_feedback]
-  │   └─ Returns outcome with full context snapshot
-  │
-  ├─ Extract only: goal + last_response
-  │
+  ├─ Extract: goal + last_response only
   ├─ RunDOT(evaluator.dot)  ← fresh context + submission only
-  │   └─ Returns outcome with full context snapshot
-  │
-  └─ If status.return_feedback exists → rejected, loop with feedback
-     If not → approved, return success
+  └─ Check: status.return_feedback exists → rejected, loop with feedback
+            otherwise → approved
 ```
 
-Rejection is detected by checking if `status.return_feedback` exists in the evaluator's final context — that node is only visited on the FAIL path. Capped at 3 rejection cycles (configurable via `MaxRejections`).
+**Boundary keys**:
+- Developer → Evaluator: `goal`, `last_response`
+- Evaluator → Developer: `evaluator_feedback`
+- Rejection signal: `status.return_feedback` exists in evaluator context
 
-Code-producing stages (`implement`, `eval_builder`) use **Codex 5.3** (`gpt-5.3-codex`). All reasoning, planning, review, and judgment stages use **Claude Opus** (`claude-opus-4-6`).
+The evaluator never sees the developer's `status.*` keys, planning notes, retry history, or internal state.
+
+### Developer pipeline (`developer.dot`)
+
+Plan → Sprint Breakdown → Implement → QA → Submit. Opus plans and reviews, Codex implements. QA failure loops back to implement with `loop_restart`. The implement stage checks `$evaluator_feedback` for rejection details.
+
+### Evaluator pipeline (`evaluator.dot`)
+
+Receive → Orchestrate → Build test tools → QA → Visionary. The visionary can RETRY (loop back to orchestrator for better evaluation) or FAIL (rejection routes through `return_feedback` node, signaling rejection to FactoryRunner).
 
 ![Factory Pipeline](attractor/pipelines/factory.png)
 
-## Why Go
-
-Go is the right language for a pipeline orchestrator. The properties that matter most — deterministic concurrency, fast startup, static binaries, and a type system that catches structural errors at compile time — are exactly what Go provides without ceremony.
-
-### Concurrency that maps to the problem
-
-Attractor pipelines fan out to parallel branches, poll child pipelines, and stream events to frontends. Go's goroutines and channels map directly to these patterns. The `parallel` handler runs branches concurrently with semaphore-bounded parallelism, each branch getting an isolated context clone. No thread pool configuration, no executor framework — just `go func()` with a `sync.WaitGroup` and a buffered channel for results. The `sync.RWMutex` on Context gives concurrent read access during parallel execution while serializing writes, which is exactly the access pattern pipeline state requires.
-
-### Type safety where it counts
-
-The graph model (`attractor/graph`) uses typed accessors — `node.GoalGate()` returns `bool`, `node.MaxRetries()` returns `int`, `node.Timeout()` returns `time.Duration`. Attribute parsing happens once at parse time, not scattered across handlers at runtime. The handler registry maps type strings to `Handler` interface implementations with compile-time guarantees. If a handler doesn't implement `Execute(node, context, graph, logsRoot) Outcome`, it doesn't compile.
-
-### Zero-overhead extensibility
-
-New handlers, lint rules, transforms, and LLM providers are all interfaces with single-method contracts. Adding a custom handler is:
+## Writing a custom handler
 
 ```go
-registry.Register("my_type", myHandler{})
+type MyHandler struct{}
+
+func (h *MyHandler) Execute(ctx context.Context, node *graph.Node, pctx *state.Context, g *graph.Graph, logsRoot string) (*state.Outcome, error) {
+    // Read from context
+    goal := pctx.GetString("goal", "")
+
+    // Read node attributes
+    prompt := node.Prompt()
+    model := node.Attrs["model"]
+
+    // Do work...
+
+    // Return outcome with context updates
+    return &state.Outcome{
+        Status:         state.StatusSuccess,
+        ContextUpdates: map[string]any{"last_response": result},
+    }, nil
+}
+
+// Register it
+registry := handler.DefaultRegistryFull(backend, interviewer)
+registry.Register("my_type", &MyHandler{})
 ```
 
-No reflection, no annotation processing, no dependency injection container. The handler registry is a `map[string]Handler` with a `Resolve` method. Custom lint rules implement `LintRule` with an `Apply(graph) []Diagnostic` method. Transforms implement `Apply(graph) Graph`. The patterns are obvious and the compiler enforces them.
+## Writing a custom pipeline
 
-### Production behavior by default
+```dot
+digraph my_pipeline {
+    goal = "Do something useful"
+    default_max_retry = "3"
 
-Checkpoints use atomic write-then-rename to prevent corruption on crash. The artifact store spills to disk at 100KB to prevent memory bloat on long-running pipelines. Retry policies use exponential backoff with jitter to avoid thundering herd. Context cloning uses JSON marshal/unmarshal for deep copy — not the fastest approach, but correct by construction and impossible to accidentally share mutable state between parallel branches.
+    start [shape=Mdiamond, label="Begin"]
+    step1 [shape=box, label="Step 1", prompt="...", goal_gate="true"]
+    gate  [shape=diamond, type="conditional", label="Check"]
+    exit  [shape=Msquare, label="Done"]
 
-## Architecture
-
-```
-attractor-go/
-├── attractor/           Pipeline engine
-│   ├── parser/          Three-phase DOT parser (strip → tokenize → parse)
-│   ├── graph/           Typed graph model with O(1) node lookup
-│   ├── engine/          Core execution loop and checkpoint-aware runner
-│   ├── factory/         FactoryRunner — context-isolated developer/evaluator orchestration
-│   ├── handler/         Pluggable handler registry (codergen, human, parallel, tool, ...)
-│   ├── state/           Thread-safe context, checkpointing, artifact store
-│   ├── condition/       Condition expression evaluator (=, !=, &&)
-│   ├── validation/      13 lint rules across three severity levels
-│   ├── stylesheet/      CSS-like model configuration with specificity cascade
-│   ├── transform/       AST transforms (variable expansion, stylesheet application)
-│   └── pipelines/       Embedded pipeline definitions (.dot files)
-├── unifiedllm/          Provider-agnostic LLM client
-│   ├── provider/        Adapters for Anthropic, OpenAI, Gemini
-│   ├── client/          Multi-provider client with middleware chain
-│   ├── types/           Unified message/content/tool types
-│   ├── retry/           Retry with backoff for LLM calls
-│   └── sse/             Server-sent events parser for streaming
-├── codingagent/         Coding agent runtime
-│   ├── session/         Agent session lifecycle management
-│   ├── tools/           Tool registry for agent capabilities
-│   ├── profile/         Agent profile configuration
-│   ├── events/          Typed event stream
-│   ├── env/             Environment detection
-│   └── truncation/      Context window management
-└── go.mod
+    start -> step1 -> gate
+    gate -> exit  [condition="outcome=success", label="Pass"]
+    gate -> step1 [condition="outcome=fail", label="Retry", loop_restart="true"]
+}
 ```
 
-### How a pipeline runs
+Key attributes:
+- `goal_gate="true"` — pipeline can't exit until this node succeeds
+- `max_retries="N"` — N retries (N+1 total attempts) before giving up
+- `retry_target="node_id"` — where to jump on failure
+- `loop_restart="true"` on an edge — clears context and restarts tracking
+- `condition="outcome=success"` on an edge — only take this edge when condition matches
 
-1. **Parse** — The DOT parser strips comments, tokenizes (handling quoted strings, qualified identifiers, hyphenated names), and builds a graph via recursive descent.
-2. **Transform** — Variable expansion replaces `$goal` in prompts. The stylesheet transform applies CSS-like model rules with specificity cascade (universal < class < ID).
-3. **Validate** — 13 lint rules check structural correctness (start/exit nodes, reachability via BFS, edge targets), semantic validity (condition syntax, retry targets), and conventions (type names, fidelity modes). Errors block execution; warnings don't.
-4. **Execute** — The engine traverses from the start node. Each node's handler is resolved from the registry, executed with retry policy, and the outcome drives edge selection through a deterministic 5-step algorithm: condition match → preferred label → suggested IDs → weight → lexical tiebreak.
-5. **Checkpoint** — After each node, state is atomically saved. Resume restores context, completed nodes, and retry counters. Goal gates are enforced before exit.
+## Project structure
 
-### Edge selection
+```
+attractor/
+├── engine/       Runner, Config, Run(), edge selection, retry, checkpoint
+├── factory/      FactoryRunner, boundary functions, context isolation
+├── parser/       DOT parser (strip → tokenize → parse)
+├── graph/        Node, Edge, Graph with typed attribute accessors
+├── handler/      Handler interface, Registry, all built-in handlers
+├── state/        Context, Outcome, Checkpoint, ArtifactStore
+├── condition/    Condition expression evaluator (=, !=, &&)
+├── validation/   13 lint rules (error/warning/info severity)
+├── transform/    Variable expansion, stylesheet application
+├── stylesheet/   CSS-like model config with specificity cascade
+├── pipelines/    Embedded .dot files (developer, evaluator, factory)
+unifiedllm/       Provider-agnostic LLM client (Anthropic, OpenAI, Gemini)
+codingagent/      Coding agent runtime (session, tools, profiles, events)
+```
 
-The routing algorithm is the heart of the engine. After a node completes, outgoing edges are evaluated in strict priority order:
+## Key files
 
-1. **Condition match** — Edges with `condition` expressions that evaluate to true against the current context and outcome
-2. **Preferred label** — If the outcome suggests a label, match it (normalized: lowercase, trimmed, accelerator keys stripped)
-3. **Suggested next IDs** — Explicit node IDs from the outcome
-4. **Highest weight** — Among unconditional edges, highest `weight` wins
-5. **Lexical tiebreak** — Alphabetical by target node ID
+| What | Where |
+|------|-------|
+| Engine entry point | `attractor/engine/engine.go` — `Run()` |
+| Runner (parse+run) | `attractor/engine/runner.go` — `RunDOT()`, `RunGraph()` |
+| Factory orchestrator | `attractor/factory/factory.go` — `FactoryRunner` |
+| Context boundary | `attractor/factory/boundary.go` — extraction functions |
+| Handler interface | `attractor/handler/handler.go` — `Handler`, `Registry` |
+| Pipeline context | `attractor/state/state.go` — `Context`, `Outcome`, `Checkpoint` |
+| DOT parser | `attractor/parser/parser.go` |
+| Built-in pipelines | `attractor/pipelines/*.dot` |
 
-This gives pipeline authors precise control over routing while keeping behavior deterministic and inspectable.
+## Build and test
 
-## Unified LLM Client
-
-The `unifiedllm` package provides a single interface across LLM providers. The design prioritizes correctness over convenience — every provider adapter implements the same `ProviderAdapter` interface, and the client resolves providers through explicit configuration, model catalog lookup, or environment auto-detection.
-
-Key capabilities:
-- **Streaming with tool loops** — `Stream()` pauses on tool calls, executes them, and resumes. `Generate()` runs blocking tool loops up to `MaxToolRounds`.
-- **Structured output** — `GenerateObject()` validates responses against JSON schemas with fallback markdown fence extraction.
-- **Middleware** — Onion-pattern request/response interceptors for logging, metrics, or request modification.
-- **Unified types** — Messages, content blocks (text, image, audio, document, tool calls, thinking), and usage tracking work identically across providers.
-
-## Spec Compliance
-
-This implementation covers the full [Attractor specification](https://github.com/strongdm/attractor), including:
-
-- Complete DOT subset parser with chained edges, subgraphs, default blocks, and multi-line attributes
-- All 9 built-in handler types (start, exit, codergen, wait.human, conditional, parallel, fan-in, tool, manager loop, communication)
-- 5-step edge selection algorithm with condition evaluation
-- Goal gate enforcement with retry target fallback chain
-- Exponential backoff with jitter retry policies
-- Thread-safe context with RWMutex, deep cloning for parallel isolation
-- Atomic checkpointing with crash recovery and resume
-- CSS-like model stylesheet with specificity cascade
-- Composable AST transforms (variable expansion, stylesheet application)
-- 13 built-in lint rules with extensible rule interface
-- Human-in-the-loop via Interviewer abstraction (auto-approve, console, callback, queue, recording)
-- Artifact store with automatic disk spillover
-- Context fidelity modes (full, truncate, compact, summary:low/medium/high)
-- Event streaming for pipeline lifecycle observability
-
-## License
-
-See [LICENSE](LICENSE) for details.
+```sh
+go build ./...
+go test ./attractor/...
+```

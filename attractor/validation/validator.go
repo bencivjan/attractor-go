@@ -109,6 +109,7 @@ var knownHandlerTypes = map[string]bool{
 	"parallel.fan_in":    true,
 	"tool":               true,
 	"stack.manager_loop": true,
+	"communication":     true,
 }
 
 // validFidelityModes is the set of recognised fidelity mode values used by
@@ -201,9 +202,15 @@ func (reachabilityRule) Apply(g *graph.Graph) []Diagnostic {
 	var diags []Diagnostic
 
 	// Collect unreachable node IDs and sort for deterministic output.
+	// Skip inbound communication nodes — they are external entry points
+	// that receive input from other pipelines and are not reachable from
+	// the start node in standalone mode.
 	var unreachable []string
-	for id := range g.Nodes {
+	for id, node := range g.Nodes {
 		if !reachable[id] {
+			if node.Type() == "communication" && node.Attrs["direction"] == "inbound" {
+				continue
+			}
 			unreachable = append(unreachable, id)
 		}
 	}

@@ -67,8 +67,9 @@ var ShapeToType = map[string]string{
 	"diamond":       "conditional",
 	"component":     "parallel",
 	"tripleoctagon": "parallel.fan_in",
-	"parallelogram": "tool",
-	"house":         "stack.manager_loop",
+	"parallelogram":  "tool",
+	"house":          "stack.manager_loop",
+	"doubleoctagon":  "communication",
 }
 
 // NewRegistry creates a Registry with the given default handler.
@@ -744,6 +745,29 @@ func (h *StackManagerLoopHandler) Execute(_ context.Context, node *graph.Node, p
 }
 
 // ---------------------------------------------------------------------------
+// CommunicationHandler
+// ---------------------------------------------------------------------------
+
+// CommunicationHandler is a pass-through for inter-pipeline communication
+// nodes (shape=doubleoctagon). It returns Success immediately and records
+// the communication direction (inbound/outbound) in context updates so
+// downstream logic or the factory pipeline can act on it.
+type CommunicationHandler struct{}
+
+// Execute passes through and records direction metadata.
+func (h *CommunicationHandler) Execute(_ context.Context, node *graph.Node, _ *state.Context, _ *graph.Graph, _ string) (*state.Outcome, error) {
+	direction := node.Attrs["direction"]
+	return &state.Outcome{
+		Status: state.StatusSuccess,
+		Notes:  fmt.Sprintf("Communication node '%s' (%s) passed through", node.ID, direction),
+		ContextUpdates: map[string]any{
+			"last_stage":              node.ID,
+			"communication.direction": direction,
+		},
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // NoopHandler
 // ---------------------------------------------------------------------------
 
@@ -783,6 +807,7 @@ func DefaultRegistryFull(backend CodergenBackend, interv interviewer.Interviewer
 	r.Register("parallel.fan_in", &FanInHandler{})
 	r.Register("tool", &ToolHandler{})
 	r.Register("stack.manager_loop", &StackManagerLoopHandler{})
+	r.Register("communication", &CommunicationHandler{})
 
 	return r
 }

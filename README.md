@@ -6,21 +6,27 @@ Attractor lets you define complex LLM pipelines as directed graphs in Graphviz D
 
 ## Pipelines
 
-Two pipelines ship out of the box. Both are defined as `.dot` files in `attractor/pipelines/` — the same declarative format the engine parses and executes. They demonstrate how DOT graphs compose LLM stages with conditional routing, goal gates, and feedback loops.
+Three pipelines ship out of the box. All are defined as `.dot` files in `attractor/pipelines/` — the same declarative format the engine parses and executes. They demonstrate how DOT graphs compose LLM stages with conditional routing, goal gates, and feedback loops.
 
-### Plan-Build-Verify
+### Plan-Build-Verify (Developer)
 
-A software development pipeline that plans, implements, and verifies a feature. Claude Opus handles planning and QA; Codex writes the code. When QA fails, the pipeline loops back to implementation with the failure details in context, so Codex can fix the issues without re-planning from scratch.
+A software development pipeline that plans, implements, and verifies a feature. Claude Opus handles planning and QA; Codex writes the code. When QA fails, the pipeline loops back to implementation with the failure details in context. Communication nodes mark where the evaluator can take over (outbound) and where evaluator rejection feedback enters (inbound).
 
 ![Plan-Build-Verify Pipeline](attractor/pipelines/developer.png)
 
 ### Evaluator
 
-An evaluation pipeline that reviews submissions against a project vision. Four role-separated agents — orchestrator, builder, QA, visionary — decompose the evaluation the way a human team would. The visionary can loop back to the orchestrator when the evaluation itself was insufficient (wrong tools, missing checks), triggering a refined delegation plan and a full re-run of builder and QA.
+An evaluation pipeline that reviews submissions against a project vision. Four role-separated agents — orchestrator, builder, QA, visionary — decompose the evaluation the way a human team would. The visionary can loop back to the orchestrator when the evaluation itself was insufficient. Communication nodes mark where developer output enters (inbound) and where rejection feedback exits (outbound).
 
 ![Evaluator Pipeline](attractor/pipelines/evaluator.png)
 
-See [`evaluator.md`](attractor/pipelines/evaluator.md) for a detailed walkthrough of the evaluator's stages and feedback loop.
+See [`evaluator_pipeline.md`](attractor/pipelines/evaluator_pipeline.md) for a detailed walkthrough of the evaluator's stages and feedback loop.
+
+### Factory (Combined)
+
+The end-to-end pipeline that wires the developer and evaluator together. After the developer's QA passes, the code hands off directly to the evaluator's orchestrator. If the evaluator's visionary rejects the submission, feedback routes back to the developer's implementation stage with the rejection context so Codex can address the issues. The evaluator's internal retry loop (visionary → orchestrator) remains for insufficient evaluations.
+
+![Factory Pipeline](attractor/pipelines/factory.png)
 
 ## Why Go
 
@@ -114,7 +120,7 @@ Key capabilities:
 This implementation covers the full [Attractor specification](https://github.com/strongdm/attractor), including:
 
 - Complete DOT subset parser with chained edges, subgraphs, default blocks, and multi-line attributes
-- All 8 built-in handler types (start, exit, codergen, wait.human, conditional, parallel, fan-in, tool, manager loop)
+- All 9 built-in handler types (start, exit, codergen, wait.human, conditional, parallel, fan-in, tool, manager loop, communication)
 - 5-step edge selection algorithm with condition evaluation
 - Goal gate enforcement with retry target fallback chain
 - Exponential backoff with jitter retry policies

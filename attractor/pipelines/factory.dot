@@ -5,17 +5,35 @@
 // the evaluator reviews the result against the project vision. Evaluator
 // rejection feeds back to the developer's implementation stage.
 //
-// Stages (developer phase):
-//   1. High-Level Plan     (Claude Opus)  — architecture and strategy
-//   2. Sprint Breakdown    (Claude Opus)  — decompose into sprint-sized work
-//   3. Implement           (Codex)        — write production code
-//   4. QA Verification     (Claude Opus)  — verify implementation matches plans
+// Model assignments:
+//   Code-producing stages use OpenAI Codex (gpt-5.3-codex) — the model
+//   optimised for writing and modifying source code. All reasoning,
+//   planning, review, and judgment stages use Claude Opus (claude-opus-4-6).
 //
-// Stages (evaluator phase):
-//   5. Eval Orchestrator   (Claude Opus)  — receive submission, delegate tasks
-//   6. Eval Builder        (Codex 5.3)    — build tools/harnesses for QA
-//   7. Eval QA             (Claude Opus)  — run tools against the submission
-//   8. Eval Visionary      (Claude Opus)  — judge against goal, return feedback
+//   Codex stages:   implement, eval_builder
+//   Opus stages:    high_level_plan, sprint_breakdown, qa_verify,
+//                   eval_orchestrator, eval_qa, eval_visionary
+//
+// Orchestration:
+//   The evaluator phase should be kicked off and run by a completely
+//   separate orchestrator agent. The developer agent owns stages 1–4;
+//   once QA passes, a distinct evaluator agent takes ownership of
+//   stages 5–8. This separation ensures the evaluator has no shared
+//   state or bias from the developer's execution context — it receives
+//   only the submitted artifacts and the project vision, not the
+//   developer's internal planning or retry history.
+//
+// Stages (developer phase — developer agent):
+//   1. High-Level Plan     (Claude Opus)    — architecture and strategy
+//   2. Sprint Breakdown    (Claude Opus)    — decompose into sprint-sized work
+//   3. Implement           (Codex 5.3)      — write production code
+//   4. QA Verification     (Claude Opus)    — verify implementation matches plans
+//
+// Stages (evaluator phase — separate evaluator agent):
+//   5. Eval Orchestrator   (Claude Opus)    — receive submission, delegate tasks
+//   6. Eval Builder        (Codex 5.3)      — build tools/harnesses for QA
+//   7. Eval QA             (Claude Opus)    — run tools against the submission
+//   8. Eval Visionary      (Claude Opus)    — judge against goal, return feedback
 //
 // Feedback loops:
 //   - QA fail → implement (developer internal loop)

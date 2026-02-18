@@ -4,19 +4,29 @@ A production-grade Go implementation of the [Attractor specification](https://gi
 
 Attractor lets you define complex LLM pipelines as directed graphs in Graphviz DOT syntax. Nodes are tasks (LLM calls, human gates, parallel fan-outs), edges are transitions with conditions and weights, and the engine handles traversal, retries, checkpointing, and human interaction. This implementation covers the full spec and pairs it with a unified LLM client and coding agent runtime.
 
-## Factory Pipeline
+## Pipelines
 
-`FactoryRunner` (`attractor/factory`) orchestrates the built-in development workflow by running two pipelines as **completely separate executions** with no shared state:
+Three pipelines ship out of the box. All are defined as `.dot` files in `attractor/pipelines/` — the same declarative format the engine parses and executes. They demonstrate how DOT graphs compose LLM stages with conditional routing, goal gates, and feedback loops.
 
-- **Developer** (`developer.dot`) — Plan → Sprint Breakdown → Implement → QA. Claude Opus plans and reviews; Codex writes code. QA failure loops back to implementation.
-- **Evaluator** (`evaluator.dot`) — Orchestrate → Build test tools → Run QA → Visionary judgment. The visionary can loop back to the orchestrator when the evaluation itself was insufficient.
+### Plan-Build-Verify (Developer)
 
-Each pipeline gets a fresh `state.Context`. Only explicitly defined keys cross the boundary:
+A software development pipeline that plans, implements, and verifies a feature. Claude Opus handles planning and QA; Codex writes the code. When QA fails, the pipeline loops back to implementation with the failure details in context. Communication nodes mark where the evaluator can take over (outbound) and where evaluator rejection feedback enters (inbound).
 
-| Direction | Keys | Purpose |
-|-----------|------|---------|
-| Developer → Evaluator | `goal`, `last_response` | Submission for review |
-| Evaluator → Developer | `evaluator_feedback` | Rejection details |
+![Plan-Build-Verify Pipeline](attractor/pipelines/developer.png)
+
+### Evaluator
+
+An evaluation pipeline that reviews submissions against a project vision. Four role-separated agents — orchestrator, builder, QA, visionary — decompose the evaluation the way a human team would. The visionary can loop back to the orchestrator when the evaluation itself was insufficient. Communication nodes mark where developer output enters (inbound) and where rejection feedback exits (outbound).
+
+![Evaluator Pipeline](attractor/pipelines/evaluator.png)
+
+See [`evaluator_pipeline.md`](attractor/pipelines/evaluator_pipeline.md) for a detailed walkthrough of the evaluator's stages and feedback loop.
+
+### Factory (Combined)
+
+The end-to-end pipeline that wires the developer and evaluator together. `FactoryRunner` (`attractor/factory`) orchestrates this by running `developer.dot` and `evaluator.dot` as **completely separate pipeline executions** — each gets a fresh `state.Context` with no shared state.
+
+**Context isolation**: Only two keys cross the developer-to-evaluator boundary: `goal` and `last_response`. The evaluator never sees the developer's planning notes, `status.*` keys, retry history, or internal state. On rejection, only `evaluator_feedback` (mapped from the evaluator's `last_response`) crosses back to the developer.
 
 ```
 FactoryRunner.RunWithGoal()
@@ -24,16 +34,20 @@ FactoryRunner.RunWithGoal()
   for each iteration (up to MaxRejections):
   │
   ├─ RunDOT(developer.dot)  ← fresh context + goal [+ evaluator_feedback]
+  │   └─ Returns outcome with full context snapshot
   │
   ├─ Extract only: goal + last_response
   │
   ├─ RunDOT(evaluator.dot)  ← fresh context + submission only
+  │   └─ Returns outcome with full context snapshot
   │
   └─ If status.return_feedback exists → rejected, loop with feedback
      If not → approved, return success
 ```
 
-Rejection is detected by checking if `status.return_feedback` exists in the evaluator's final context — that node is only visited on the FAIL path. Capped at 3 rejection cycles by default.
+Rejection is detected by checking if `status.return_feedback` exists in the evaluator's final context — that node is only visited on the FAIL path. Capped at 3 rejection cycles (configurable via `MaxRejections`).
+
+Code-producing stages (`implement`, `eval_builder`) use **Codex 5.3** (`gpt-5.3-codex`). All reasoning, planning, review, and judgment stages use **Claude Opus** (`claude-opus-4-6`).
 
 ![Factory Pipeline](attractor/pipelines/factory.png)
 

@@ -31,6 +31,11 @@ type Runner struct {
 	// MaxSteps is a safety limit on the total number of node executions.
 	// Defaults to 1000 when zero.
 	MaxSteps int
+
+	// InitialContext is an optional set of key-value pairs applied to the
+	// pipeline context before execution begins. Used by FactoryRunner to
+	// seed a pipeline with values from a prior run.
+	InitialContext map[string]any
 }
 
 // NewRunner creates a Runner with the given handler registry and the default
@@ -136,9 +141,10 @@ func (r *Runner) buildConfig(logsRoot string) Config {
 	}
 
 	return Config{
-		LogsRoot: logsRoot,
-		Registry: registry,
-		OnEvent:  r.OnEvent,
-		MaxSteps: r.MaxSteps,
+		LogsRoot:       logsRoot,
+		Registry:       registry,
+		OnEvent:        r.OnEvent,
+		MaxSteps:       r.MaxSteps,
+		InitialContext: r.InitialContext,
 	}
 }

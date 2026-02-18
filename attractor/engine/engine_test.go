@@ -1016,6 +1016,53 @@ func TestRunnerRunDefault(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: InitialContext values appear in final outcome
+// ---------------------------------------------------------------------------
+
+func TestInitialContext_AppliedToRun(t *testing.T) {
+	g := makeStartExitGraph()
+	cfg := defaultCfg(t)
+	cfg.InitialContext = map[string]any{
+		"seed_key":  "seed_value",
+		"seed_num":  42,
+	}
+
+	outcome, err := Run(context.Background(), g, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != state.StatusSuccess {
+		t.Fatalf("expected success, got %q", outcome.Status)
+	}
+
+	snap := outcome.ContextUpdates
+	if snap["seed_key"] != "seed_value" {
+		t.Errorf("expected seed_key='seed_value', got %v", snap["seed_key"])
+	}
+	if snap["seed_num"] != 42 {
+		t.Errorf("expected seed_num=42, got %v", snap["seed_num"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test: InitialContext nil is a no-op
+// ---------------------------------------------------------------------------
+
+func TestInitialContext_Nil(t *testing.T) {
+	g := makeStartExitGraph()
+	cfg := defaultCfg(t)
+	cfg.InitialContext = nil
+
+	outcome, err := Run(context.Background(), g, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != state.StatusSuccess {
+		t.Fatalf("expected success, got %q", outcome.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test: RunPipeline with unknown name returns error
 // ---------------------------------------------------------------------------
 

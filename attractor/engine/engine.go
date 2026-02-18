@@ -45,6 +45,12 @@ type Config struct {
 	// single run. This prevents infinite loops from consuming resources
 	// unboundedly. Defaults to 1000 when zero.
 	MaxSteps int
+
+	// InitialContext is an optional set of key-value pairs applied to the
+	// pipeline context after graph attributes are mirrored but before
+	// execution begins. This allows callers (such as FactoryRunner) to
+	// seed the context with values from a prior pipeline run.
+	InitialContext map[string]any
 }
 
 func (c Config) maxSteps() int {
@@ -139,6 +145,11 @@ func Run(ctx context.Context, g *graph.Graph, cfg Config) (*state.Outcome, error
 	// Initialize pipeline context with graph-level attributes.
 	pctx := state.NewContext()
 	mirrorGraphAttributes(g, pctx)
+
+	// Apply caller-provided initial context (e.g. from FactoryRunner).
+	if len(cfg.InitialContext) > 0 {
+		pctx.ApplyUpdates(cfg.InitialContext)
+	}
 
 	// Set pipeline context keys (Section 5.1).
 	startTime := time.Now()

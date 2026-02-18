@@ -16,9 +16,11 @@ The feedback loop between the visionary and orchestrator adds a critical layer: 
 
 ## Orchestration
 
-In the combined [factory pipeline](../../README.md#factory-combined), the evaluator phase is kicked off and run by a **completely separate orchestrator agent** from the developer phase. The evaluator agent receives only the submitted artifacts and the project vision — it has no access to the developer's internal planning, retry history, or execution context. This separation prevents bias and ensures the evaluation is independent.
+`FactoryRunner` (`attractor/factory`) enforces the separation by running this pipeline as a **completely independent `RunDOT` call** with a fresh `state.Context`. The evaluator receives only `goal` and `last_response` from the developer — no planning notes, `status.*` keys, retry history, or internal state cross the boundary.
 
-The builder stage (`eval_builder`) uses **Codex 5.3** (`gpt-5.3-codex`) for tool/harness construction. All other stages — orchestrator, QA, and visionary — use **Claude Opus** (`claude-opus-4-6`) for reasoning and judgment.
+On rejection (visionary returns FAIL), FactoryRunner extracts the evaluator's `last_response` as `evaluator_feedback` and injects it into the developer's next iteration. This is the only data that crosses back.
+
+The builder stage uses **Codex 5.3** (`gpt-5.3-codex`) for tool/harness construction. All other stages — orchestrator, QA, and visionary — use **Claude Opus** (`claude-opus-4-6`) for reasoning and judgment.
 
 ## Communication nodes
 
@@ -29,7 +31,7 @@ The evaluator pipeline includes two **communication nodes** (shape=`doubleoctago
 | **receive_submission** | inbound | Entry point for developer output. In standalone mode, a pass-through from start. In the factory pipeline, the developer's QA-passed code enters here. |
 | **return_feedback** | outbound | Exit point for rejection feedback. In standalone mode, flows through to exit. In the factory pipeline, rejection feedback routes back to the developer's implementation stage. |
 
-These nodes are no-ops in standalone mode — they pass through immediately. In the combined [factory pipeline](../../README.md#factory), the engine wires them to the developer pipeline's corresponding communication nodes.
+These nodes are no-ops in standalone mode — they pass through immediately. When run via `FactoryRunner`, `receive_submission` receives the developer's output through `InitialContext`, and `return_feedback`'s presence in the final context (`status.return_feedback`) signals rejection to the FactoryRunner.
 
 ## Stages
 

@@ -24,9 +24,28 @@ See [`evaluator_pipeline.md`](attractor/pipelines/evaluator_pipeline.md) for a d
 
 ### Factory (Combined)
 
-The end-to-end pipeline that wires the developer and evaluator together. After the developer's QA passes, the code hands off directly to the evaluator's orchestrator. If the evaluator's visionary rejects the submission, feedback routes back to the developer's implementation stage with the rejection context so Codex can address the issues. The evaluator's internal retry loop (visionary → orchestrator) remains for insufficient evaluations.
+The end-to-end pipeline that wires the developer and evaluator together. `FactoryRunner` (`attractor/factory`) orchestrates this by running `developer.dot` and `evaluator.dot` as **completely separate pipeline executions** — each gets a fresh `state.Context` with no shared state.
 
-The two phases are run by **separate orchestrator agents**. The developer agent owns planning through QA (stages 1–4); a distinct evaluator agent takes over for stages 5–8. This ensures the evaluator has no shared state or bias from the developer's execution context — it receives only the submitted artifacts and the project vision.
+**Context isolation**: Only two keys cross the developer-to-evaluator boundary: `goal` and `last_response`. The evaluator never sees the developer's planning notes, `status.*` keys, retry history, or internal state. On rejection, only `evaluator_feedback` (mapped from the evaluator's `last_response`) crosses back to the developer.
+
+```
+FactoryRunner.RunWithGoal()
+  │
+  for each iteration (up to MaxRejections):
+  │
+  ├─ RunDOT(developer.dot)  ← fresh context + goal [+ evaluator_feedback]
+  │   └─ Returns outcome with full context snapshot
+  │
+  ├─ Extract only: goal + last_response
+  │
+  ├─ RunDOT(evaluator.dot)  ← fresh context + submission only
+  │   └─ Returns outcome with full context snapshot
+  │
+  └─ If status.return_feedback exists → rejected, loop with feedback
+     If not → approved, return success
+```
+
+Rejection is detected by checking if `status.return_feedback` exists in the evaluator's final context — that node is only visited on the FAIL path. Capped at 3 rejection cycles (configurable via `MaxRejections`).
 
 Code-producing stages (`implement`, `eval_builder`) use **Codex 5.3** (`gpt-5.3-codex`). All reasoning, planning, review, and judgment stages use **Claude Opus** (`claude-opus-4-6`).
 
@@ -66,6 +85,7 @@ attractor-go/
 │   ├── parser/          Three-phase DOT parser (strip → tokenize → parse)
 │   ├── graph/           Typed graph model with O(1) node lookup
 │   ├── engine/          Core execution loop and checkpoint-aware runner
+│   ├── factory/         FactoryRunner — context-isolated developer/evaluator orchestration
 │   ├── handler/         Pluggable handler registry (codergen, human, parallel, tool, ...)
 │   ├── state/           Thread-safe context, checkpointing, artifact store
 │   ├── condition/       Condition expression evaluator (=, !=, &&)

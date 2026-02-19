@@ -87,7 +87,44 @@ Plan → Sprint Breakdown → Implement → QA → Submit. Opus plans and review
 
 Receive → Orchestrate → Build test tools → QA → Visionary. The visionary can RETRY (loop back to orchestrator for better evaluation) or FAIL (rejection routes through `return_feedback` node, signaling rejection to FactoryRunner).
 
-![Factory Pipeline](attractor/pipelines/factory.png)
+```mermaid
+flowchart TD
+    start(["Begin"])
+
+    subgraph developer ["Developer Agent"]
+        plan["High-Level Plan\n<i>Claude Opus</i>"]
+        sprints["Sprint Breakdown\n<i>Claude Opus</i>"]
+        impl["Implement Code\n<i>Codex 5.3</i>"]
+        qa{"QA Verification\n<i>Claude Opus</i>"}
+    end
+
+    subgraph evaluator ["Evaluator Agent (separate context)"]
+        orch["Eval Orchestrator\n<i>Claude Opus</i>"]
+        builder["Eval Builder\n<i>Codex 5.3</i>"]
+        evalqa["Eval QA\n<i>Claude Opus</i>"]
+        visionary{"Eval Visionary\n<i>Claude Opus</i>"}
+    end
+
+    done(["Done"])
+
+    start --> plan
+    plan --> sprints
+    sprints --> impl
+    impl --> qa
+
+    qa -- "QA Passed" --> orch
+    qa -- "QA Passed (partial)" --> orch
+    qa -- "QA Failed\n(loop_restart)" --> impl
+
+    orch --> builder
+    builder --> evalqa
+    evalqa --> visionary
+
+    visionary -- "Approved" --> done
+    visionary -- "Approved (partial)" --> done
+    visionary -- "Refine Evaluation" --> orch
+    visionary -- "Rejected" --> impl
+```
 
 ## Writing a custom handler
 

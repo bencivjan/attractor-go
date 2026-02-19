@@ -98,7 +98,7 @@ flowchart TD
         qa{"QA Verification\n<i>Claude Opus</i>"}
     end
 
-    subgraph evaluator ["Evaluator Agent (separate context)"]
+    subgraph evaluator ["Evaluator Agent (separate orchestrator)"]
         orch["Eval Orchestrator\n<i>Claude Opus</i>"]
         builder["Eval Builder\n<i>Codex 5.3</i>"]
         evalqa["Eval QA\n<i>Claude Opus</i>"]

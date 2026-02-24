@@ -4,21 +4,26 @@
 //
 //	attractor <command> [flags]
 //
-// Commands: run, validate, list, factory
+// Commands: run, validate, list, factory, serve
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/strongdm/attractor-go/attractor/engine"
 	"github.com/strongdm/attractor-go/attractor/factory"
 	"github.com/strongdm/attractor-go/attractor/handler"
 	"github.com/strongdm/attractor-go/attractor/parser"
 	"github.com/strongdm/attractor-go/attractor/pipelines"
+	"github.com/strongdm/attractor-go/attractor/server"
 	"github.com/strongdm/attractor-go/attractor/state"
 	"github.com/strongdm/attractor-go/attractor/transform"
 	"github.com/strongdm/attractor-go/attractor/validation"
@@ -34,6 +39,7 @@ Commands:
   validate   Lint a .dot file and report errors/warnings
   list       List built-in pipeline names
   factory    Run the developer→evaluator factory loop
+  serve      Start the HTTP API server for pipeline management
 
 Run "attractor <command> --help" for details on each command.
 `
@@ -56,6 +62,8 @@ func main() {
 		cmdList(args)
 	case "factory":
 		cmdFactory(args)
+	case "serve":
+		cmdServe(args)
 	case "--help", "-h", "help":
 		fmt.Print(usage)
 	default:
@@ -327,5 +335,68 @@ Flags:
 	}
 	if len(parts) > 0 {
 		fmt.Printf("Pipelines:  %s\n", strings.Join(parts, ", "))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// serve
+// ---------------------------------------------------------------------------
+
+func cmdServe(args []string) {
+	fs := flag.NewFlagSet("attractor serve", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "Listen address (host:port)")
+	logs := fs.String("logs", "attractor-logs", "Directory for run logs, checkpoints, and artifacts")
+	maxSteps := fs.Int("max-steps", 0, "Maximum node executions per pipeline run (0 = default 1000)")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `attractor serve — start the HTTP API server
+
+Usage:
+  attractor serve [-addr <host:port>] [-logs <dir>] [-max-steps <n>]
+
+Starts an HTTP server that exposes a REST API for submitting, monitoring,
+and interacting with pipeline executions. Pipelines are submitted as DOT
+source via POST /pipelines and run in background goroutines. Human gates
+are answered via the /questions endpoints.
+
+Endpoints:
+  POST   /pipelines                           Submit DOT source and start execution
+  GET    /pipelines/{id}                      Get pipeline status and progress
+  GET    /pipelines/{id}/events               SSE stream of pipeline events
+  POST   /pipelines/{id}/cancel               Cancel a running pipeline
+  GET    /pipelines/{id}/graph                Get DOT source
+  GET    /pipelines/{id}/questions            Get pending human interaction questions
+  POST   /pipelines/{id}/questions/{qid}/answer  Submit answer to a question
+  GET    /pipelines/{id}/checkpoint            Get current checkpoint state
+  GET    /pipelines/{id}/context              Get current context key-value store
+  GET    /health                              Health check
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	srv := server.NewServer(*logs)
+	srv.MaxSteps = *maxSteps
+
+	// Handle graceful shutdown on SIGINT/SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		fmt.Fprintf(os.Stderr, "\nreceived %s, shutting down...\n", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "shutdown error: %v\n", err)
+		}
+	}()
+
+	fmt.Fprintf(os.Stderr, "attractor server listening on %s\n", *addr)
+	if err := srv.ListenAndServe(*addr); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 }

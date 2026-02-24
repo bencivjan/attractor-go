@@ -116,12 +116,10 @@ func NewAnthropicProfile(model string) *BaseProfile {
 		supportsParallelToolCalls: true,
 		contextWindowSize:         200000,
 		providerOptions: map[string]any{
-			"anthropic": map[string]any{
-				"beta_headers": []string{
-					"interleaved-thinking-2025-05-14",
-					"prompt-caching-2024-07-31",
-					"token-efficient-tools-2025-02-19",
-				},
+			"anthropic_beta": []string{
+				"interleaved-thinking-2025-05-14",
+				"prompt-caching-2024-07-31",
+				"token-efficient-tools-2025-02-19",
 			},
 		},
 		systemPromptTemplate: anthropicSystemPrompt,

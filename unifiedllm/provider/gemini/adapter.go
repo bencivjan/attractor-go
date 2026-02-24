@@ -90,7 +90,10 @@ func New(opts ...AdapterOption) *Adapter {
 func FromEnv() (*Adapter, error) {
 	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
-		return nil, types.NewConfigurationError("GEMINI_API_KEY environment variable is not set", nil)
+		key = os.Getenv("GOOGLE_API_KEY")
+	}
+	if key == "" {
+		return nil, types.NewConfigurationError("GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable is not set", nil)
 	}
 
 	opts := []AdapterOption{WithAPIKey(key)}

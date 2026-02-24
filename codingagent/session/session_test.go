@@ -235,8 +235,8 @@ func TestSession_CreationAndStates(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if s.State != StateAwaitingInput {
-		t.Errorf("expected state awaiting_input after submit, got %q", s.State)
+	if s.State != StateIdle {
+		t.Errorf("expected state idle after submit, got %q", s.State)
 	}
 
 	s.Close()

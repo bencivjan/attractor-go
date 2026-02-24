@@ -175,12 +175,31 @@ func (c *Client) Complete(ctx context.Context, req types.Request) (*types.Respon
 }
 
 // Stream sends a streaming request and returns a channel of events.
+// Request-phase middleware is applied to transform the request before it
+// reaches the provider. Full streaming middleware (event-level wrapping)
+// is not yet implemented.
 func (c *Client) Stream(ctx context.Context, req types.Request) (<-chan types.StreamEvent, error) {
 	adapter, err := c.resolveProvider(req)
 	if err != nil {
 		return nil, err
 	}
-	return adapter.Stream(ctx, req)
+
+	// Apply middleware in request-only mode: each middleware runs its
+	// pre-call logic but the "next" function captures the final request
+	// for the streaming call.
+	finalReq := req
+	if len(c.middleware) > 0 {
+		var capturedReq types.Request
+		capture := func(ctx context.Context, r types.Request) (*types.Response, error) {
+			capturedReq = r
+			// Return a dummy response; we only want the request transformation.
+			return &types.Response{}, nil
+		}
+		_, _ = c.applyMiddleware(ctx, req, capture)
+		finalReq = capturedReq
+	}
+
+	return adapter.Stream(ctx, finalReq)
 }
 
 // Close releases all registered provider resources.

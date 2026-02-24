@@ -265,7 +265,7 @@ func (s *Session) Submit(ctx context.Context, input string) error {
 
 	s.mu.Lock()
 	if s.State != StateClosed {
-		s.State = StateAwaitingInput
+		s.State = StateIdle
 	}
 	// Drain follow-up queue.
 	var followups []string
@@ -345,6 +345,9 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 		Content:   input,
 		Timestamp: time.Now(),
 	})
+
+	// Drain any pending steering messages before the first LLM call (spec 2.5).
+	s.drainSteering()
 
 	toolRound := 0
 
@@ -485,6 +488,8 @@ func (s *Session) buildRequest() types.Request {
 		Model:           s.Profile.Model(),
 		Messages:        allMessages,
 		Tools:           toolDefs,
+		ToolChoice:      &types.ToolChoice{Mode: "auto"},
+		Provider:        s.Profile.ID(),
 		ReasoningEffort: s.Config.ReasoningEffort,
 		ProviderOptions: s.Profile.ProviderOptions(),
 	}

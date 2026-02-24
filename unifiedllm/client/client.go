@@ -44,12 +44,19 @@ type ProviderAdapter interface {
 // can inspect/modify the request, call next, and inspect/modify the response.
 type Middleware func(ctx context.Context, req types.Request, next func(context.Context, types.Request) (*types.Response, error)) (*types.Response, error)
 
+// StreamMiddleware intercepts individual streaming events. It receives a
+// pointer to the event and returns the (possibly modified) event. Return nil
+// to suppress the event entirely. This enables use cases such as logging,
+// cost tracking, content filtering, and metrics collection on a per-event basis.
+type StreamMiddleware func(event *types.StreamEvent) *types.StreamEvent
+
 // Client holds registered providers, routes requests to the appropriate adapter,
 // and applies middleware to every call.
 type Client struct {
-	providers       map[string]ProviderAdapter
-	defaultProvider string
-	middleware      []Middleware
+	providers        map[string]ProviderAdapter
+	defaultProvider  string
+	middleware       []Middleware
+	streamMiddleware []StreamMiddleware
 }
 
 // Option configures a Client during construction.
@@ -75,6 +82,16 @@ func WithDefaultProvider(name string) Option {
 func WithMiddleware(m ...Middleware) Option {
 	return func(c *Client) {
 		c.middleware = append(c.middleware, m...)
+	}
+}
+
+// WithStreamMiddleware appends one or more stream middleware functions to the
+// chain. Stream middleware is applied in the order provided: each event passes
+// through the first middleware, then the second, and so on. A middleware may
+// modify the event or return nil to suppress it.
+func WithStreamMiddleware(m ...StreamMiddleware) Option {
+	return func(c *Client) {
+		c.streamMiddleware = append(c.streamMiddleware, m...)
 	}
 }
 
@@ -175,6 +192,14 @@ func (c *Client) SetDefaultProvider(name string) {
 	c.defaultProvider = name
 }
 
+// UseStreamMiddleware appends a stream middleware function at runtime. Stream
+// middleware intercepts individual streaming events, allowing callers to log,
+// modify, or suppress events before they reach the consumer. Middleware is
+// applied in registration order.
+func (c *Client) UseStreamMiddleware(mw StreamMiddleware) {
+	c.streamMiddleware = append(c.streamMiddleware, mw)
+}
+
 // Complete sends a blocking completion request. The request is routed to the
 // appropriate provider based on the Provider field, the Model field (via catalog
 // lookup), or the default provider. Middleware is applied around the call.
@@ -193,8 +218,8 @@ func (c *Client) Complete(ctx context.Context, req types.Request) (*types.Respon
 
 // Stream sends a streaming request and returns a channel of events.
 // Request-phase middleware is applied to transform the request before it
-// reaches the provider. Full streaming middleware (event-level wrapping)
-// is not yet implemented.
+// reaches the provider. Stream middleware is then applied to each event,
+// allowing callers to log, modify, or suppress events before consumption.
 func (c *Client) Stream(ctx context.Context, req types.Request) (<-chan types.StreamEvent, error) {
 	adapter, err := c.resolveProvider(req)
 	if err != nil {
@@ -216,7 +241,42 @@ func (c *Client) Stream(ctx context.Context, req types.Request) (<-chan types.St
 		finalReq = capturedReq
 	}
 
-	return adapter.Stream(ctx, finalReq)
+	rawCh, err := adapter.Stream(ctx, finalReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// If no stream middleware is registered, return the raw channel directly.
+	if len(c.streamMiddleware) == 0 {
+		return rawCh, nil
+	}
+
+	return c.applyStreamMiddleware(rawCh), nil
+}
+
+// applyStreamMiddleware wraps an event channel so that each event passes
+// through all registered stream middleware in order. If any middleware returns
+// nil, the event is suppressed and not forwarded.
+func (c *Client) applyStreamMiddleware(in <-chan types.StreamEvent) <-chan types.StreamEvent {
+	out := make(chan types.StreamEvent, cap(in))
+
+	go func() {
+		defer close(out)
+		for event := range in {
+			ev := &event
+			for _, mw := range c.streamMiddleware {
+				ev = mw(ev)
+				if ev == nil {
+					break
+				}
+			}
+			if ev != nil {
+				out <- *ev
+			}
+		}
+	}()
+
+	return out
 }
 
 // Close releases all registered provider resources.

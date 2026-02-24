@@ -746,6 +746,7 @@ func (a *Adapter) processStream(ctx context.Context, reader io.Reader, ch chan<-
 
 	var currentToolCallID string
 	var currentToolCallName string
+	var currentBlockType string // "text", "tool_use", or "thinking"
 
 	for {
 		select {
@@ -799,8 +800,8 @@ func (a *Adapter) processStream(ctx context.Context, reader io.Reader, ch chan<-
 
 		case "content_block_start":
 			if contentBlock, ok := data["content_block"].(map[string]any); ok {
-				blockType, _ := contentBlock["type"].(string)
-				switch blockType {
+				currentBlockType, _ = contentBlock["type"].(string)
+				switch currentBlockType {
 				case "text":
 					ch <- types.StreamEvent{
 						Type: types.StreamEventTextStart,
@@ -869,9 +870,9 @@ func (a *Adapter) processStream(ctx context.Context, reader io.Reader, ch chan<-
 			}
 
 		case "content_block_stop":
-			// Determine what type of block ended. The index can help, but we
-			// use the current state to decide.
-			if currentToolCallID != "" {
+			// Emit the correct end event based on the tracked block type.
+			switch currentBlockType {
+			case "tool_use":
 				ch <- types.StreamEvent{
 					Type: types.StreamEventToolCallEnd,
 					ToolCall: &types.ToolCallData{
@@ -883,13 +884,18 @@ func (a *Adapter) processStream(ctx context.Context, reader io.Reader, ch chan<-
 				}
 				currentToolCallID = ""
 				currentToolCallName = ""
-			} else {
-				// Could be text end or reasoning end. Send text end as default.
+			case "thinking":
+				ch <- types.StreamEvent{
+					Type: types.StreamEventReasoningEnd,
+					Raw:  data,
+				}
+			default:
 				ch <- types.StreamEvent{
 					Type: types.StreamEventTextEnd,
 					Raw:  data,
 				}
 			}
+			currentBlockType = ""
 
 		case "message_delta":
 			// Contains stop_reason and usage delta.

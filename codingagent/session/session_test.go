@@ -699,17 +699,17 @@ func TestDetectLoop_ThreeConsecutiveIdentical(t *testing.T) {
 	client := newMockLLMClient()
 	s := newTestSession(client)
 	s.Config.EnableLoopDetection = true
-	s.Config.LoopDetectionWindow = 10
+	s.Config.LoopDetectionWindow = 6
 
-	// Three identical tool call assistant turns.
-	for i := 0; i < 3; i++ {
+	// Six identical tool call assistant turns (fills the window).
+	for i := 0; i < 6; i++ {
 		s.History = append(s.History, &AssistantTurn{
 			ToolCalls: []types.ToolCall{{ID: "1", Name: "same_tool", Arguments: map[string]any{"x": "y"}}},
 		})
 	}
 
 	if !s.detectLoop() {
-		t.Error("expected loop detected for 3 identical consecutive tool call rounds")
+		t.Error("expected loop detected for 6 identical consecutive tool call rounds")
 	}
 }
 
@@ -721,10 +721,10 @@ func TestDetectLoop_AlternatingPattern(t *testing.T) {
 	client := newMockLLMClient()
 	s := newTestSession(client)
 	s.Config.EnableLoopDetection = true
-	s.Config.LoopDetectionWindow = 10
+	s.Config.LoopDetectionWindow = 6
 
-	// Alternating A-B-A-B pattern.
-	for i := 0; i < 4; i++ {
+	// Alternating A-B-A-B-A-B pattern (fills window of 6 with pattern len 2).
+	for i := 0; i < 6; i++ {
 		name := "tool_a"
 		if i%2 == 1 {
 			name = "tool_b"
@@ -735,7 +735,7 @@ func TestDetectLoop_AlternatingPattern(t *testing.T) {
 	}
 
 	if !s.detectLoop() {
-		t.Error("expected loop detected for A-B-A-B alternating pattern")
+		t.Error("expected loop detected for A-B-A-B-A-B alternating pattern")
 	}
 }
 

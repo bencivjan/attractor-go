@@ -71,9 +71,8 @@ func Truncate(output string, maxChars int, mode Mode) string {
 
 	switch mode {
 	case ModeHeadTail:
-		// Split budget: 60% to head, 40% to tail. This biases toward
-		// keeping the beginning which often contains headers or errors.
-		headBudget := maxChars * 6 / 10
+		// Split budget 50/50 between head and tail (spec 5.1).
+		headBudget := maxChars / 2
 		tailBudget := maxChars - headBudget
 
 		head := output[:headBudget]

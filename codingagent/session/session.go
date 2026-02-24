@@ -280,14 +280,27 @@ func (s *Session) Submit(ctx context.Context, input string) error {
 	s.followupQueue = nil
 	s.mu.Unlock()
 
-	// Process any queued follow-up messages.
+	// Process any queued follow-up messages (these are part of the same
+	// processing cycle, so SESSION_END fires only once after all are done).
 	for _, fu := range followups {
-		if fuErr := s.Submit(ctx, fu); fuErr != nil {
+		if fuErr := s.processInput(ctx, fu); fuErr != nil {
+			s.emitSessionEnd()
 			return fuErr
 		}
 	}
 
+	s.emitSessionEnd()
 	return err
+}
+
+// emitSessionEnd emits SESSION_END if the session is not closed.
+func (s *Session) emitSessionEnd() {
+	s.mu.Lock()
+	closed := s.State == StateClosed
+	s.mu.Unlock()
+	if !closed {
+		s.EventEmitter.Emit(events.EventSessionEnd, s.ID, nil)
+	}
 }
 
 // Steer queues a message to be injected into the conversation after the
@@ -977,17 +990,16 @@ func (s *Session) drainSteering() {
 // Loop detection
 // ---------------------------------------------------------------------------
 
-// detectLoop examines the recent tool-call history for repeating patterns.
-// It hashes each tool-round's calls and checks for consecutive duplicates
-// within the detection window.
+// detectLoop examines the recent tool-call history for repeating patterns
+// of length 1, 2, or 3 within the detection window (spec Section 2.10).
+// The window must be fully populated before detection activates.
 func (s *Session) detectLoop() bool {
 	window := s.Config.LoopDetectionWindow
-	if window < 2 {
-		window = 2
+	if window < 3 {
+		window = 6 // reasonable default to detect patterns of length 1-3
 	}
 
-	// Collect hashes of recent tool-results turns (each preceded by an
-	// assistant turn with tool calls).
+	// Collect hashes of recent assistant turns with tool calls.
 	var hashes []string
 	for _, turn := range s.History {
 		at, ok := turn.(*AssistantTurn)
@@ -997,38 +1009,28 @@ func (s *Session) detectLoop() bool {
 		hashes = append(hashes, hashToolCalls(at.ToolCalls))
 	}
 
-	if len(hashes) < 2 {
+	// Window must be fully populated before detection activates (spec 2.10).
+	if len(hashes) < window {
 		return false
 	}
 
-	// Only look at the last `window` hashes.
-	start := 0
-	if len(hashes) > window {
-		start = len(hashes) - window
-	}
-	recent := hashes[start:]
+	// Use only the last `window` hashes.
+	recent := hashes[len(hashes)-window:]
 
-	// Check for the same hash repeating 3+ times consecutively. This
-	// indicates the model is stuck in an identical tool-call loop.
-	if len(recent) >= 3 {
-		last := recent[len(recent)-1]
-		repeatCount := 0
-		for i := len(recent) - 1; i >= 0; i-- {
-			if recent[i] == last {
-				repeatCount++
-			} else {
+	// Check for repeating patterns of length 1, 2, and 3.
+	for patternLen := 1; patternLen <= 3; patternLen++ {
+		if window%patternLen != 0 {
+			continue
+		}
+		pattern := recent[:patternLen]
+		allMatch := true
+		for i := patternLen; i < window; i++ {
+			if recent[i] != pattern[i%patternLen] {
+				allMatch = false
 				break
 			}
 		}
-		if repeatCount >= 3 {
-			return true
-		}
-	}
-
-	// Check for alternating patterns (A-B-A-B).
-	if len(recent) >= 4 {
-		n := len(recent)
-		if recent[n-1] == recent[n-3] && recent[n-2] == recent[n-4] && recent[n-1] != recent[n-2] {
+		if allMatch {
 			return true
 		}
 	}
@@ -1138,18 +1140,15 @@ func extractToolCalls(resp *types.Response) []types.ToolCall {
 	return calls
 }
 
-// validateToolArgs checks that required parameters are present in the
-// tool arguments. Returns nil if validation passes (spec Section 3.8).
+// validateToolArgs checks that required parameters are present and that
+// argument types match the JSON Schema declarations (spec Section 3.8).
 func validateToolArgs(def tools.Definition, args map[string]any) error {
 	if len(def.Parameters) == 0 {
 		return nil
 	}
-	reqSlice, ok := def.Parameters["required"]
-	if !ok {
-		return nil
-	}
-	// The "required" field may be []string or []any depending on how
-	// the tool was registered.
+
+	// Check required fields.
+	reqSlice, _ := def.Parameters["required"]
 	var required []string
 	switch r := reqSlice.(type) {
 	case []string:
@@ -1160,8 +1159,6 @@ func validateToolArgs(def tools.Definition, args map[string]any) error {
 				required = append(required, s)
 			}
 		}
-	default:
-		return nil
 	}
 	var missing []string
 	for _, name := range required {
@@ -1172,7 +1169,72 @@ func validateToolArgs(def tools.Definition, args map[string]any) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required parameter(s): %s", strings.Join(missing, ", "))
 	}
+
+	// Type-check each argument against the properties schema.
+	props, _ := def.Parameters["properties"].(map[string]any)
+	if props == nil {
+		return nil
+	}
+	var typeErrors []string
+	for name, val := range args {
+		propSchema, ok := props[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		expectedType, _ := propSchema["type"].(string)
+		if expectedType == "" {
+			continue
+		}
+		if err := checkJSONType(name, val, expectedType); err != "" {
+			typeErrors = append(typeErrors, err)
+		}
+	}
+	if len(typeErrors) > 0 {
+		return fmt.Errorf("argument type error(s): %s", strings.Join(typeErrors, "; "))
+	}
 	return nil
+}
+
+// checkJSONType validates that val matches the expected JSON Schema type.
+// Returns an error description or empty string on success.
+func checkJSONType(name string, val any, expectedType string) string {
+	switch expectedType {
+	case "string":
+		if _, ok := val.(string); !ok {
+			return fmt.Sprintf("%s: expected string, got %T", name, val)
+		}
+	case "integer":
+		switch v := val.(type) {
+		case float64:
+			if v != float64(int(v)) {
+				return fmt.Sprintf("%s: expected integer, got float", name)
+			}
+		case int:
+			// ok
+		default:
+			return fmt.Sprintf("%s: expected integer, got %T", name, val)
+		}
+	case "number":
+		switch val.(type) {
+		case float64, int:
+			// ok
+		default:
+			return fmt.Sprintf("%s: expected number, got %T", name, val)
+		}
+	case "boolean":
+		if _, ok := val.(bool); !ok {
+			return fmt.Sprintf("%s: expected boolean, got %T", name, val)
+		}
+	case "object":
+		if _, ok := val.(map[string]any); !ok {
+			return fmt.Sprintf("%s: expected object, got %T", name, val)
+		}
+	case "array":
+		if _, ok := val.([]any); !ok {
+			return fmt.Sprintf("%s: expected array, got %T", name, val)
+		}
+	}
+	return ""
 }
 
 // readRawFile reads the entire file content as a string without line numbers.
@@ -1205,7 +1267,7 @@ func formatExecResult(r *env.ExecResult) string {
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
-		b.WriteString(fmt.Sprintf("Command timed out after %dms", r.DurationMs))
+		fmt.Fprintf(&b, "[ERROR: Command timed out after %dms. Partial output is shown above.\nYou can retry with a longer timeout by setting the timeout_ms parameter.]", r.DurationMs)
 	}
 
 	if r.ExitCode != 0 {

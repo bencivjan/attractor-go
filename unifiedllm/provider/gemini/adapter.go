@@ -146,7 +146,7 @@ func (a *Adapter) Complete(ctx context.Context, req types.Request) (*types.Respo
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, a.parseError(resp.StatusCode, respBody)
+		return nil, a.parseError(resp.StatusCode, respBody, resp.Header)
 	}
 
 	var raw map[string]any
@@ -192,7 +192,7 @@ func (a *Adapter) Stream(ctx context.Context, req types.Request) (<-chan types.S
 		if readErr != nil {
 			return nil, types.NewNetworkError("failed to read error response", readErr)
 		}
-		return nil, a.parseError(resp.StatusCode, respBody)
+		return nil, a.parseError(resp.StatusCode, respBody, resp.Header)
 	}
 
 	ch := make(chan types.StreamEvent, 64)
@@ -834,7 +834,7 @@ func (a *Adapter) processStream(ctx context.Context, reader io.Reader, ch chan<-
 // ---------------------------------------------------------------------------
 
 // parseError extracts error information from a non-200 response.
-func (a *Adapter) parseError(statusCode int, body []byte) error {
+func (a *Adapter) parseError(statusCode int, body []byte, headers http.Header) error {
 	var raw map[string]any
 	_ = json.Unmarshal(body, &raw)
 
@@ -851,7 +851,15 @@ func (a *Adapter) parseError(statusCode int, body []byte) error {
 		}
 	}
 
-	return types.ErrorFromStatusCode(statusCode, message, providerName, errorCode, raw, nil)
+	// Parse Retry-After header if present (spec 6.4).
+	var retryAfter *float64
+	if ra := headers.Get("Retry-After"); ra != "" {
+		if v, err := strconv.ParseFloat(ra, 64); err == nil {
+			retryAfter = &v
+		}
+	}
+
+	return types.ErrorFromStatusCode(statusCode, message, providerName, errorCode, raw, retryAfter)
 }
 
 // ---------------------------------------------------------------------------

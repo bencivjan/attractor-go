@@ -169,6 +169,7 @@ func NewOpenAIProfile(model string) *BaseProfile {
 func NewGeminiProfile(model string) *BaseProfile {
 	registry := tools.NewRegistry()
 	registerStandardTools(registry)
+	registerWebTools(registry)
 
 	return &BaseProfile{
 		id:                        "gemini-cli",
@@ -484,6 +485,59 @@ func registerApplyPatchTool(registry *tools.Registry) {
 				},
 				"required": []string{"patch"},
 			},
+		},
+	})
+}
+
+// registerWebTools adds web_search and web_fetch stub tools used by the
+// Gemini profile. These tools are defined so the model can reference them;
+// the executors return "not implemented" until a backend is wired in.
+func registerWebTools(registry *tools.Registry) {
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "web_search",
+			Description: "Search the web for information. Returns a list of search results with titles, URLs, and snippets.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{
+						"type":        "string",
+						"description": "The search query",
+					},
+					"max_results": map[string]any{
+						"type":        "integer",
+						"description": "Maximum number of results to return (default 5)",
+					},
+				},
+				"required": []string{"query"},
+			},
+		},
+		Executor: func(args map[string]any, env any) (string, error) {
+			return "web_search is not implemented", nil
+		},
+	})
+
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "web_fetch",
+			Description: "Fetch the content of a web page at the given URL. Returns the page content as text.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": map[string]any{
+						"type":        "string",
+						"description": "The URL to fetch",
+					},
+					"extract_text": map[string]any{
+						"type":        "boolean",
+						"description": "If true, extract text content only (strip HTML)",
+					},
+				},
+				"required": []string{"url"},
+			},
+		},
+		Executor: func(args map[string]any, env any) (string, error) {
+			return "web_fetch is not implemented", nil
 		},
 	})
 }

@@ -174,6 +174,9 @@ func (n *Node) AutoStatus() bool { return attrBool(n.Attrs, "auto_status") }
 // AllowPartial returns whether partial results are acceptable.
 func (n *Node) AllowPartial() bool { return attrBool(n.Attrs, "allow_partial") }
 
+// BackoffPreset returns the named backoff preset for this node (e.g., "standard", "aggressive").
+func (n *Node) BackoffPreset() string { return n.Attrs["backoff_preset"] }
+
 // ---------------------------------------------------------------------------
 // Edge
 // ---------------------------------------------------------------------------

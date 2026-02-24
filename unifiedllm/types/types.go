@@ -7,7 +7,10 @@
 package types
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -581,4 +584,43 @@ func ValidateToolName(name string) error {
 		return fmt.Errorf("tool name %q is invalid: must start with a letter and contain only alphanumeric characters and underscores", name)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Image file auto-encoding
+// ---------------------------------------------------------------------------
+
+// imageExtToMIME maps file extensions to their MIME types for image encoding.
+var imageExtToMIME = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+}
+
+// ImageFromFile reads an image file from disk, detects its MIME type from the
+// file extension, base64-encodes the contents, and returns a ContentPart with
+// Kind=ContentKindImage. Supported extensions: .png, .jpg, .jpeg, .gif, .webp.
+func ImageFromFile(path string) (*ContentPart, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	mimeType, ok := imageExtToMIME[ext]
+	if !ok {
+		return nil, fmt.Errorf("unsupported image extension %q (supported: png, jpg, jpeg, gif, webp)", ext)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read image file %q: %w", path, err)
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+
+	return &ContentPart{
+		Kind: ContentKindImage,
+		Image: &ImageData{
+			Data:      []byte(encoded),
+			MediaType: mimeType,
+		},
+	}, nil
 }

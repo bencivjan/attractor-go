@@ -342,7 +342,7 @@ func TestValidate_InvalidConditionSyntax(t *testing.T) {
 		},
 		Edges: []*graph.Edge{
 			makeEdge("start", "work", nil),
-			makeEdge("work", "exit", map[string]string{"condition": "no_operator_here"}),
+			makeEdge("work", "exit", map[string]string{"condition": "key= "}),
 		},
 		Attrs: map[string]string{},
 	}

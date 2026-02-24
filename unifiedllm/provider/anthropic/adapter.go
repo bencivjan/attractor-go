@@ -22,6 +22,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/strongdm/attractor-go/unifiedllm/sse"
 	"github.com/strongdm/attractor-go/unifiedllm/types"
@@ -36,10 +37,11 @@ const (
 
 // Adapter implements ProviderAdapter for the Anthropic Messages API.
 type Adapter struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
-	headers    map[string]string
+	apiKey             string
+	baseURL            string
+	httpClient         *http.Client
+	headers            map[string]string
+	streamReadTimeout  time.Duration
 }
 
 // AdapterOption configures an Adapter.
@@ -63,6 +65,15 @@ func WithBaseURL(url string) AdapterOption {
 func WithHTTPClient(c *http.Client) AdapterOption {
 	return func(a *Adapter) {
 		a.httpClient = c
+	}
+}
+
+// WithAdapterTimeout configures per-phase timeouts (connect, request,
+// stream_read) by building an appropriately configured HTTP client.
+func WithAdapterTimeout(t types.AdapterTimeout) AdapterOption {
+	return func(a *Adapter) {
+		a.httpClient = t.HTTPClient()
+		a.streamReadTimeout = t.StreamRead
 	}
 }
 

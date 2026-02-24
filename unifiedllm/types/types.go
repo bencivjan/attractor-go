@@ -9,6 +9,8 @@ package types
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -553,6 +555,39 @@ type ModelInfo struct {
 type TimeoutConfig struct {
 	Total   time.Duration // Total timeout for entire generate call
 	PerStep time.Duration // Timeout per individual LLM call within tool loop
+}
+
+// AdapterTimeout controls per-phase timeout behaviour at the HTTP adapter
+// level. These timeouts apply to every request made by a provider adapter.
+type AdapterTimeout struct {
+	Connect    time.Duration // Time to establish HTTP connection (default: 10s)
+	Request    time.Duration // Time for entire request/response cycle (default: 120s)
+	StreamRead time.Duration // Max time between consecutive stream events (default: 30s)
+}
+
+// DefaultAdapterTimeout returns an AdapterTimeout with the spec default values.
+func DefaultAdapterTimeout() AdapterTimeout {
+	return AdapterTimeout{
+		Connect:    10 * time.Second,
+		Request:    120 * time.Second,
+		StreamRead: 30 * time.Second,
+	}
+}
+
+// HTTPClient creates a configured *http.Client that respects the adapter
+// timeout settings. The returned client uses a custom transport with the
+// connect timeout as the TLS handshake and dial timeout, and the request
+// timeout as the overall client timeout.
+func (t AdapterTimeout) HTTPClient() *http.Client {
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: t.Connect}).DialContext,
+		TLSHandshakeTimeout:  t.Connect,
+		ResponseHeaderTimeout: t.Request,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   t.Request,
+	}
 }
 
 // ---------------------------------------------------------------------------

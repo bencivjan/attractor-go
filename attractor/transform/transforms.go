@@ -170,3 +170,92 @@ func copyAttrs(attrs map[string]string) map[string]string {
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// PreambleTransform
+// ---------------------------------------------------------------------------
+
+// PreambleTransform synthesises context carryover text for pipeline stages
+// that do not use "full" fidelity mode. When the graph or individual nodes
+// specify a fidelity mode other than "full", this transform prepends a
+// preamble note to the node's prompt explaining that earlier conversation
+// context has been summarised or truncated according to the configured
+// fidelity mode.
+//
+// Unlike the other transforms which operate purely on AST attributes,
+// this transform is aware of runtime context. It is designed to be applied
+// at execution time (not parse time) via runner.RegisterTransform.
+type PreambleTransform struct {
+	// GraphFidelity is the default fidelity mode from the graph. If empty,
+	// defaults to "compact".
+	GraphFidelity string
+}
+
+func (t *PreambleTransform) Apply(g *graph.Graph) *graph.Graph {
+	graphFidelity := t.GraphFidelity
+	if graphFidelity == "" {
+		graphFidelity = g.DefaultFidelity()
+		if graphFidelity == "" {
+			graphFidelity = "compact"
+		}
+	}
+
+	updatedNodes := make(map[string]*graph.Node, len(g.Nodes))
+	for id, node := range g.Nodes {
+		fidelity := node.Fidelity()
+		if fidelity == "" {
+			fidelity = graphFidelity
+		}
+
+		if fidelity == "full" {
+			updatedNodes[id] = node
+			continue
+		}
+
+		// Build preamble text based on the fidelity mode.
+		preamble := buildPreamble(fidelity)
+		if preamble == "" {
+			updatedNodes[id] = node
+			continue
+		}
+
+		// Prepend preamble to the existing prompt.
+		attrs := copyAttrs(node.Attrs)
+		if prompt, ok := attrs["prompt"]; ok && prompt != "" {
+			attrs["prompt"] = preamble + "\n\n" + prompt
+		} else if label := node.Label(); label != "" {
+			// No prompt but has label -- use label as the prompt body.
+			attrs["prompt"] = preamble + "\n\n" + label
+		}
+
+		updatedNodes[id] = &graph.Node{
+			ID:    node.ID,
+			Attrs: attrs,
+		}
+	}
+
+	return &graph.Graph{
+		Name:  g.Name,
+		Nodes: updatedNodes,
+		Edges: g.Edges,
+		Attrs: g.Attrs,
+	}
+}
+
+// buildPreamble returns a context carryover note for the given fidelity mode.
+func buildPreamble(fidelity string) string {
+	switch strings.ToLower(fidelity) {
+	case "truncate":
+		return "[Context note: Earlier conversation history has been truncated. Only the most recent exchanges are included below.]"
+	case "compact":
+		return "[Context note: Earlier conversation history has been compacted. Key decisions and outcomes are preserved, but verbose details have been removed.]"
+	case "summary:low":
+		return "[Context note: Earlier conversation history has been summarised at a low detail level. Only major milestones and final outcomes are included.]"
+	case "summary:medium":
+		return "[Context note: Earlier conversation history has been summarised at a medium detail level. Key decisions, outcomes, and important intermediate steps are included.]"
+	case "summary:high":
+		return "[Context note: Earlier conversation history has been summarised at a high detail level. Most decisions and their rationale are preserved.]"
+	default:
+		return ""
+	}
+}

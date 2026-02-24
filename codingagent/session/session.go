@@ -122,12 +122,13 @@ func (t *UserTurn) TurnTimestamp() time.Time { return t.Timestamp }
 // AssistantTurn records the model's response including any tool calls,
 // reasoning traces, and token usage.
 type AssistantTurn struct {
-	Content    string
-	ToolCalls  []types.ToolCall
-	Reasoning  string
-	Usage      types.Usage
-	ResponseID string
-	Timestamp  time.Time
+	Content            string
+	ToolCalls          []types.ToolCall
+	Reasoning          string
+	ThinkingSignature  string
+	Usage              types.Usage
+	ResponseID         string
+	Timestamp          time.Time
 }
 
 func (t *AssistantTurn) TurnType() string       { return "assistant" }
@@ -388,12 +389,13 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 		reasoning := resp.Reasoning()
 
 		assistantTurn := &AssistantTurn{
-			Content:    assistantText,
-			ToolCalls:  toolCalls,
-			Reasoning:  reasoning,
-			Usage:      resp.Usage,
-			ResponseID: resp.ID,
-			Timestamp:  time.Now(),
+			Content:           assistantText,
+			ToolCalls:         toolCalls,
+			Reasoning:         reasoning,
+			ThinkingSignature: extractThinkingSignature(resp),
+			Usage:             resp.Usage,
+			ResponseID:        resp.ID,
+			Timestamp:         time.Now(),
 		}
 		s.History = append(s.History, assistantTurn)
 
@@ -541,7 +543,8 @@ func buildAssistantContent(t *AssistantTurn) []types.ContentPart {
 		parts = append(parts, types.ContentPart{
 			Kind: types.ContentKindThinking,
 			Thinking: &types.ThinkingData{
-				Text: t.Reasoning,
+				Text:      t.Reasoning,
+				Signature: t.ThinkingSignature,
 			},
 		})
 	}
@@ -592,13 +595,20 @@ func toolResultContent(r types.ToolResult) (string, bool) {
 // Tool execution
 // ---------------------------------------------------------------------------
 
-// executeToolCalls runs all tool calls from a single assistant turn. Tool
-// calls are executed sequentially to maintain deterministic ordering and
-// prevent resource contention.
+// executeToolCalls runs all tool calls from a single assistant turn. When the
+// provider profile supports parallel tool calls and multiple calls are present,
+// they are executed concurrently. Otherwise they run sequentially.
 func (s *Session) executeToolCalls(ctx context.Context, toolCalls []types.ToolCall) []types.ToolResult {
+	if s.Profile.SupportsParallelToolCalls() && len(toolCalls) > 1 {
+		return s.executeToolCallsParallel(ctx, toolCalls)
+	}
+	return s.executeToolCallsSequential(ctx, toolCalls)
+}
+
+// executeToolCallsSequential runs tool calls one at a time.
+func (s *Session) executeToolCallsSequential(ctx context.Context, toolCalls []types.ToolCall) []types.ToolResult {
 	results := make([]types.ToolResult, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		// Check for abort between tool calls.
 		select {
 		case <-s.abortCh:
 			results = append(results, types.ToolResult{
@@ -620,6 +630,22 @@ func (s *Session) executeToolCalls(ctx context.Context, toolCalls []types.ToolCa
 		result := s.executeSingleTool(ctx, tc)
 		results = append(results, result)
 	}
+	return results
+}
+
+// executeToolCallsParallel runs all tool calls concurrently and collects
+// results in the original order.
+func (s *Session) executeToolCallsParallel(ctx context.Context, toolCalls []types.ToolCall) []types.ToolResult {
+	results := make([]types.ToolResult, len(toolCalls))
+	var wg sync.WaitGroup
+	wg.Add(len(toolCalls))
+	for i, tc := range toolCalls {
+		go func(idx int, call types.ToolCall) {
+			defer wg.Done()
+			results[idx] = s.executeSingleTool(ctx, call)
+		}(i, tc)
+	}
+	wg.Wait()
 	return results
 }
 
@@ -662,17 +688,24 @@ func (s *Session) executeSingleTool(ctx context.Context, tc types.ToolCall) type
 		}
 	}
 
-	// Apply truncation.
+	// Preserve full output for the event stream before truncating.
+	fullOutput := output
+
+	// Apply truncation for the LLM context.
 	output = truncation.TruncateToolOutput(output, tc.Name, s.Config.ToolOutputLimits)
 
 	durationMs := time.Since(startTime).Milliseconds()
 
+	// The TOOL_CALL_END event carries the full untruncated output so that
+	// host applications always have access to complete output even though
+	// the model sees an abbreviated version.
 	s.EventEmitter.Emit(events.EventToolCallEnd, s.ID, map[string]any{
 		"tool_call_id": tc.ID,
 		"tool_name":    tc.Name,
 		"duration_ms":  durationMs,
 		"is_error":     isError,
-		"output_len":   len(output),
+		"output":       fullOutput,
+		"output_len":   len(fullOutput),
 	})
 
 	return types.ToolResult{
@@ -937,6 +970,21 @@ func (s *Session) countTurns() int {
 // ---------------------------------------------------------------------------
 
 // extractToolCalls converts the response's tool call data into types.ToolCall.
+// extractThinkingSignature returns the signature from the first thinking block
+// in the response. The Anthropic API requires this signature when replaying
+// thinking blocks in subsequent conversation turns.
+func extractThinkingSignature(resp *types.Response) string {
+	if resp == nil {
+		return ""
+	}
+	for _, p := range resp.Message.Content {
+		if p.Kind == types.ContentKindThinking && p.Thinking != nil && p.Thinking.Signature != "" {
+			return p.Thinking.Signature
+		}
+	}
+	return ""
+}
+
 func extractToolCalls(resp *types.Response) []types.ToolCall {
 	data := resp.ToolCalls()
 	calls := make([]types.ToolCall, len(data))

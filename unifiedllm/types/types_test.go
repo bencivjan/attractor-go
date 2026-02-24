@@ -615,6 +615,41 @@ func TestToolDefinition(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ValidateToolName
+// ---------------------------------------------------------------------------
+
+func TestValidateToolName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"valid simple name", "search", false},
+		{"valid with underscore", "get_weather", false},
+		{"valid with numbers", "tool123", false},
+		{"valid mixed", "myTool_v2", false},
+		{"valid single letter", "x", false},
+		{"valid max length", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789__", false}, // 64 chars
+		{"empty string", "", true},
+		{"starts with number", "1tool", true},
+		{"starts with underscore", "_tool", true},
+		{"contains hyphen", "my-tool", true},
+		{"contains space", "my tool", true},
+		{"contains dot", "my.tool", true},
+		{"too long", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789___", true}, // 65 chars
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateToolName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateToolName(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Role constants
 // ---------------------------------------------------------------------------
 

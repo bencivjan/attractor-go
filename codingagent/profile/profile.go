@@ -22,9 +22,9 @@ type ProviderProfile interface {
 	// ToolRegistry returns the tool registry for this profile.
 	ToolRegistry() *tools.Registry
 	// BuildSystemPrompt constructs the system prompt incorporating the
-	// working directory, project documentation, and provider-specific
+	// environment context, project documentation, and provider-specific
 	// instructions.
-	BuildSystemPrompt(workDir string, projectDocs string) string
+	BuildSystemPrompt(envContext string, projectDocs string) string
 	// Tools returns the list of tool definitions to include in LLM requests.
 	Tools() []tools.Definition
 	// ProviderOptions returns provider-specific request options (e.g.
@@ -39,6 +39,12 @@ type ProviderProfile interface {
 	SupportsParallelToolCalls() bool
 	// ContextWindowSize returns the model's context window in tokens.
 	ContextWindowSize() int
+	// InstructionFileNames returns the project instruction files this profile
+	// should load (e.g. ["AGENTS.md", "CLAUDE.md"] for Anthropic).
+	InstructionFileNames() []string
+	// KnowledgeCutoff returns the model family's knowledge cutoff date string
+	// (e.g. "2025-04").
+	KnowledgeCutoff() string
 }
 
 // ---------------------------------------------------------------------------
@@ -58,16 +64,20 @@ type BaseProfile struct {
 	contextWindowSize         int
 	providerOptions           map[string]any
 	systemPromptTemplate      string
+	instructionFileNames      []string
+	knowledgeCutoff           string
 }
 
-func (p *BaseProfile) ID() string                    { return p.id }
-func (p *BaseProfile) Model() string                 { return p.model }
-func (p *BaseProfile) ToolRegistry() *tools.Registry  { return p.registry }
+func (p *BaseProfile) ID() string                      { return p.id }
+func (p *BaseProfile) Model() string                   { return p.model }
+func (p *BaseProfile) ToolRegistry() *tools.Registry   { return p.registry }
 func (p *BaseProfile) ProviderOptions() map[string]any { return p.providerOptions }
-func (p *BaseProfile) SupportsReasoning() bool        { return p.supportsReasoning }
-func (p *BaseProfile) SupportsStreaming() bool         { return p.supportsStreaming }
+func (p *BaseProfile) SupportsReasoning() bool         { return p.supportsReasoning }
+func (p *BaseProfile) SupportsStreaming() bool          { return p.supportsStreaming }
 func (p *BaseProfile) SupportsParallelToolCalls() bool { return p.supportsParallelToolCalls }
 func (p *BaseProfile) ContextWindowSize() int          { return p.contextWindowSize }
+func (p *BaseProfile) InstructionFileNames() []string  { return p.instructionFileNames }
+func (p *BaseProfile) KnowledgeCutoff() string         { return p.knowledgeCutoff }
 
 // Tools returns all tool definitions from the registry.
 func (p *BaseProfile) Tools() []tools.Definition {
@@ -77,11 +87,11 @@ func (p *BaseProfile) Tools() []tools.Definition {
 	return p.registry.Definitions()
 }
 
-// BuildSystemPrompt constructs the system prompt by substituting the working
-// directory and project docs into the template.
-func (p *BaseProfile) BuildSystemPrompt(workDir string, projectDocs string) string {
+// BuildSystemPrompt constructs the system prompt by substituting the
+// environment context and project docs into the template.
+func (p *BaseProfile) BuildSystemPrompt(envContext string, projectDocs string) string {
 	prompt := p.systemPromptTemplate
-	prompt = strings.ReplaceAll(prompt, "{{WORKING_DIR}}", workDir)
+	prompt = strings.ReplaceAll(prompt, "{{ENVIRONMENT}}", envContext)
 	prompt = strings.ReplaceAll(prompt, "{{PROJECT_DOCS}}", projectDocs)
 	return prompt
 }
@@ -107,6 +117,8 @@ func NewAnthropicProfile(model string) *BaseProfile {
 		contextWindowSize:         200000,
 		providerOptions:           map[string]any{},
 		systemPromptTemplate:      anthropicSystemPrompt,
+		instructionFileNames:      []string{"AGENTS.md", "CLAUDE.md"},
+		knowledgeCutoff:           "2025-04",
 	}
 }
 
@@ -129,6 +141,8 @@ func NewOpenAIProfile(model string) *BaseProfile {
 		contextWindowSize:         128000,
 		providerOptions:           map[string]any{},
 		systemPromptTemplate:      openAISystemPrompt,
+		instructionFileNames:      []string{"AGENTS.md", ".codex/instructions.md"},
+		knowledgeCutoff:           "2025-04",
 	}
 }
 
@@ -151,6 +165,8 @@ func NewGeminiProfile(model string) *BaseProfile {
 		contextWindowSize:         1000000,
 		providerOptions:           map[string]any{},
 		systemPromptTemplate:      geminiSystemPrompt,
+		instructionFileNames:      []string{"AGENTS.md", "GEMINI.md"},
+		knowledgeCutoff:           "2025-04",
 	}
 }
 
@@ -344,7 +360,7 @@ func registerStandardTools(registry *tools.Registry) {
 
 var anthropicSystemPrompt = fmt.Sprintf(`You are an expert software engineer with deep experience in designing, building, and scaling high-performance software systems.
 
-Working directory: {{WORKING_DIR}}
+{{ENVIRONMENT}}
 
 %s
 
@@ -353,6 +369,7 @@ You have access to tools for reading files, writing files, editing files, runnin
 When making changes:
 - Read relevant files before editing to understand context
 - Make targeted, minimal changes
+- Prefer targeted edits over full file rewrites
 - Verify your changes compile and pass tests when possible
 - Follow existing code conventions and patterns
 
@@ -360,7 +377,7 @@ When making changes:
 
 var openAISystemPrompt = fmt.Sprintf(`You are a coding assistant with access to developer tools.
 
-Working directory: {{WORKING_DIR}}
+{{ENVIRONMENT}}
 
 %s
 
@@ -370,7 +387,7 @@ You can read, write, and edit files, run shell commands, and search the codebase
 
 var geminiSystemPrompt = fmt.Sprintf(`You are a helpful coding assistant.
 
-Working directory: {{WORKING_DIR}}
+{{ENVIRONMENT}}
 
 %s
 

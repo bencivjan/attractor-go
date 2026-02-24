@@ -155,14 +155,16 @@ func newMockProfile() *mockProfile {
 
 func (p *mockProfile) ID() string                      { return "mock" }
 func (p *mockProfile) Model() string                   { return p.model }
-func (p *mockProfile) ToolRegistry() *tools.Registry    { return p.registry }
-func (p *mockProfile) Tools() []tools.Definition        { return p.registry.Definitions() }
-func (p *mockProfile) ProviderOptions() map[string]any  { return nil }
-func (p *mockProfile) SupportsReasoning() bool          { return false }
-func (p *mockProfile) SupportsStreaming() bool           { return false }
-func (p *mockProfile) SupportsParallelToolCalls() bool   { return false }
-func (p *mockProfile) ContextWindowSize() int            { return 100000 }
-func (p *mockProfile) BuildSystemPrompt(workDir string, projectDocs string) string {
+func (p *mockProfile) ToolRegistry() *tools.Registry   { return p.registry }
+func (p *mockProfile) Tools() []tools.Definition       { return p.registry.Definitions() }
+func (p *mockProfile) ProviderOptions() map[string]any { return nil }
+func (p *mockProfile) SupportsReasoning() bool         { return false }
+func (p *mockProfile) SupportsStreaming() bool          { return false }
+func (p *mockProfile) SupportsParallelToolCalls() bool { return false }
+func (p *mockProfile) ContextWindowSize() int          { return 100000 }
+func (p *mockProfile) InstructionFileNames() []string  { return nil }
+func (p *mockProfile) KnowledgeCutoff() string         { return "" }
+func (p *mockProfile) BuildSystemPrompt(envContext string, projectDocs string) string {
 	return "You are a test assistant."
 }
 

@@ -205,6 +205,11 @@ type Session struct {
 	mu            sync.Mutex
 	abortCh       chan struct{}
 	depth         int // subagent nesting depth
+
+	// envContext is the cached <environment> block generated at session start.
+	envContext string
+	// projectDocs is the cached project instruction files discovered at session start.
+	projectDocs string
 }
 
 // New creates a Session with the given profile, environment, client, and
@@ -221,6 +226,10 @@ func New(prof profile.ProviderProfile, execEnv env.ExecutionEnvironment, client 
 		LLMClient:    client,
 		abortCh:      make(chan struct{}),
 	}
+
+	// Generate cached context at session start per spec Section 6.3.
+	s.envContext = buildEnvironmentContext(execEnv, prof)
+	s.projectDocs = discoverProjectDocs(execEnv, prof.InstructionFileNames())
 
 	s.EventEmitter.Emit(events.EventSessionStart, s.ID, map[string]any{
 		"model":   prof.Model(),
@@ -453,9 +462,8 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 
 // buildRequest assembles the types.Request from the current session state.
 func (s *Session) buildRequest() types.Request {
-	// System prompt.
-	workDir := s.ExecutionEnv.WorkingDirectory()
-	systemPrompt := s.Profile.BuildSystemPrompt(workDir, "")
+	// System prompt with cached environment context and project docs.
+	systemPrompt := s.Profile.BuildSystemPrompt(s.envContext, s.projectDocs)
 
 	messages := s.convertHistoryToMessages()
 

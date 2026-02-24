@@ -67,6 +67,9 @@ func (e *ProviderError) Error() string {
 
 func (e *ProviderError) IsRetryable() bool { return e.Retryable }
 
+// GetRetryAfter returns the provider-suggested retry delay in seconds.
+func (e *ProviderError) GetRetryAfter() *float64 { return e.RetryAfter }
+
 func (e *ProviderError) Unwrap() []error {
 	errs := []error{&e.SDKError}
 	if e.Cause != nil {

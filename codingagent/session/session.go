@@ -512,7 +512,7 @@ func (s *Session) buildRequest() types.Request {
 		Messages:        allMessages,
 		Tools:           toolDefs,
 		ToolChoice:      &types.ToolChoice{Mode: "auto"},
-		Provider:        s.Profile.ID(),
+		Provider:        s.Profile.ProviderName(),
 		ReasoningEffort: s.Config.ReasoningEffort,
 		ProviderOptions: s.Profile.ProviderOptions(),
 	}

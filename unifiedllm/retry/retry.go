@@ -73,7 +73,15 @@ func IsRetryable(err error) bool {
 	return true
 }
 
-// Do executes fn with the given retry policy.
+// retryAfterHint is an interface that errors can implement to indicate a
+// provider-requested retry delay.
+type retryAfterHint interface {
+	GetRetryAfter() *float64
+}
+
+// Do executes fn with the given retry policy. If the error carries a
+// Retry-After hint, it overrides the computed delay. If the hint exceeds
+// MaxDelay, the retry is skipped (spec 6.3).
 func Do[T any](ctx context.Context, policy Policy, fn func() (T, error)) (T, error) {
 	var zero T
 
@@ -88,6 +96,20 @@ func Do[T any](ctx context.Context, policy Policy, fn func() (T, error)) (T, err
 		}
 
 		delay := policy.DelayForAttempt(attempt)
+
+		// Honor provider Retry-After hint if present (spec 6.3).
+		if hint, ok := err.(retryAfterHint); ok {
+			if ra := hint.GetRetryAfter(); ra != nil {
+				raDelay := time.Duration(*ra * float64(time.Second))
+				if raDelay > policy.MaxDelay {
+					// Retry-After exceeds max: do NOT retry.
+					return zero, err
+				}
+				if raDelay > delay {
+					delay = raDelay
+				}
+			}
+		}
 
 		if policy.OnRetry != nil {
 			policy.OnRetry(err, attempt, delay)

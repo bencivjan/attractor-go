@@ -154,6 +154,7 @@ func newMockProfile() *mockProfile {
 }
 
 func (p *mockProfile) ID() string                      { return "mock" }
+func (p *mockProfile) ProviderName() string             { return "mock" }
 func (p *mockProfile) Model() string                   { return p.model }
 func (p *mockProfile) ToolRegistry() *tools.Registry   { return p.registry }
 func (p *mockProfile) Tools() []tools.Definition       { return p.registry.Definitions() }

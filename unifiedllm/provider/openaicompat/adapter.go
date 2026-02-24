@@ -422,10 +422,12 @@ func parseUsage(usage map[string]any) types.Usage {
 			return 0
 		}
 	}
-	return types.Usage{
+	u := types.Usage{
 		InputTokens:  toInt(usage["prompt_tokens"]),
 		OutputTokens: toInt(usage["completion_tokens"]),
 	}
+	u.TotalTokens = u.InputTokens + u.OutputTokens
+	return u
 }
 
 // ---------------------------------------------------------------------------

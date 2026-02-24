@@ -17,6 +17,10 @@ import (
 type ProviderProfile interface {
 	// ID returns a unique identifier for this profile (e.g. "anthropic-claude").
 	ID() string
+	// ProviderName returns the canonical provider key used for request routing
+	// (e.g. "openai", "anthropic", "gemini"). This must match the provider
+	// names registered in the unified LLM client.
+	ProviderName() string
 	// Model returns the provider-specific model identifier.
 	Model() string
 	// ToolRegistry returns the tool registry for this profile.
@@ -56,6 +60,7 @@ type ProviderProfile interface {
 // NewGeminiProfile factories.
 type BaseProfile struct {
 	id                        string
+	providerName              string
 	model                     string
 	registry                  *tools.Registry
 	supportsReasoning         bool
@@ -69,6 +74,7 @@ type BaseProfile struct {
 }
 
 func (p *BaseProfile) ID() string                      { return p.id }
+func (p *BaseProfile) ProviderName() string             { return p.providerName }
 func (p *BaseProfile) Model() string                   { return p.model }
 func (p *BaseProfile) ToolRegistry() *tools.Registry   { return p.registry }
 func (p *BaseProfile) ProviderOptions() map[string]any { return p.providerOptions }
@@ -109,6 +115,7 @@ func NewAnthropicProfile(model string) *BaseProfile {
 
 	return &BaseProfile{
 		id:                        "anthropic-claude",
+		providerName:              "anthropic",
 		model:                     model,
 		registry:                  registry,
 		supportsReasoning:         true,
@@ -140,6 +147,7 @@ func NewOpenAIProfile(model string) *BaseProfile {
 
 	return &BaseProfile{
 		id:                        "openai-codex",
+		providerName:              "openai",
 		model:                     model,
 		registry:                  registry,
 		supportsReasoning:         true,
@@ -164,6 +172,7 @@ func NewGeminiProfile(model string) *BaseProfile {
 
 	return &BaseProfile{
 		id:                        "gemini-cli",
+		providerName:              "gemini",
 		model:                     model,
 		registry:                  registry,
 		supportsReasoning:         false,
@@ -270,6 +279,10 @@ func registerStandardTools(registry *tools.Registry) {
 					"command": map[string]any{
 						"type":        "string",
 						"description": "The shell command to execute",
+					},
+					"description": map[string]any{
+						"type":        "string",
+						"description": "A short description of what the command does (for logging)",
 					},
 					"timeout_ms": map[string]any{
 						"type":        "integer",

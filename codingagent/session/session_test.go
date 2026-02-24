@@ -388,8 +388,12 @@ func TestSession_Abort(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from abort")
 	}
-	if !strings.Contains(err.Error(), "abort") {
-		t.Errorf("expected abort-related error, got: %v", err)
+	// Abort() now transitions to StateClosed, so Submit returns "session is closed".
+	if !strings.Contains(err.Error(), "abort") && !strings.Contains(err.Error(), "closed") {
+		t.Errorf("expected abort or closed error, got: %v", err)
+	}
+	if s.State != StateClosed {
+		t.Errorf("expected state closed after abort, got %q", s.State)
 	}
 }
 

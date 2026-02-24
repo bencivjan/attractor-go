@@ -89,9 +89,13 @@ func (m *SubAgentManager) Spawn(ctx context.Context, task string, workingDir str
 		childCfg.MaxToolRoundsPerInput = maxTurns
 	}
 
-	// Resolve profile. If model override is specified and differs from parent,
-	// we create a new profile. For simplicity, use parent's profile.
+	// Resolve profile. If model override is specified and differs from the
+	// parent's model, clone the parent's profile with the new model. This
+	// enables subagents to use cheaper or more capable models as needed.
 	childProfile := m.parent.Profile
+	if model != "" && model != m.parent.Profile.Model() {
+		childProfile = cloneProfileWithModel(m.parent.Profile, model)
+	}
 
 	// Resolve execution environment. If workingDir is specified, create a
 	// scoped environment.
@@ -197,6 +201,25 @@ func (m *SubAgentManager) Close(agentID string) (SubAgentStatus, error) {
 	return status, nil
 }
 
+// CloseAll terminates all running subagents. This is used during graceful
+// shutdown to ensure no child sessions are left in a running state.
+func (m *SubAgentManager) CloseAll() {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id, handle := range m.agents {
+		handle.mu.Lock()
+		if handle.Status == SubAgentRunning {
+			ids = append(ids, id)
+		}
+		handle.mu.Unlock()
+	}
+	m.mu.Unlock()
+
+	for _, id := range ids {
+		_, _ = m.Close(id)
+	}
+}
+
 // runSubAgent executes the subagent's agentic loop.
 func (m *SubAgentManager) runSubAgent(ctx context.Context, handle *SubAgentHandle, task string) {
 	defer func() {
@@ -270,6 +293,44 @@ func extractFinalOutput(s *Session) string {
 		}
 	}
 	return ""
+}
+
+// cloneProfileWithModel creates a new profile with the given model override.
+// If the profile is a *BaseProfile (or wraps one via the ModelSettable
+// interface), the model is set directly. Otherwise, the parent profile is
+// returned unchanged since we cannot modify the model on an opaque interface.
+func cloneProfileWithModel(parent profile.ProviderProfile, model string) profile.ProviderProfile {
+	type modelSettable interface {
+		profile.ProviderProfile
+		SetModel(string)
+	}
+
+	// If the profile supports SetModel, create a shallow clone and set it.
+	if bp, ok := parent.(*profile.BaseProfile); ok {
+		// Construct a new profile from the same provider factory so we
+		// get an independent copy.
+		var cloned *profile.BaseProfile
+		switch bp.ProviderName() {
+		case "anthropic":
+			cloned = profile.NewAnthropicProfile(model)
+		case "openai":
+			cloned = profile.NewOpenAIProfile(model)
+		case "gemini":
+			cloned = profile.NewGeminiProfile(model)
+		default:
+			// Unknown provider; use the parent as-is.
+			return parent
+		}
+		return cloned
+	}
+
+	// If it implements the modelSettable interface directly, use it.
+	if ms, ok := parent.(modelSettable); ok {
+		ms.SetModel(model)
+		return ms
+	}
+
+	return parent
 }
 
 // scopeEnvironment creates a scoped execution environment for the given

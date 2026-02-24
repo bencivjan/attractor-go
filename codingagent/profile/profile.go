@@ -85,6 +85,10 @@ func (p *BaseProfile) ContextWindowSize() int          { return p.contextWindowS
 func (p *BaseProfile) InstructionFileNames() []string  { return p.instructionFileNames }
 func (p *BaseProfile) KnowledgeCutoff() string         { return p.knowledgeCutoff }
 
+// SetModel overrides the model identifier for this profile. This is used
+// when spawning subagents with a different model than the parent session.
+func (p *BaseProfile) SetModel(model string) { p.model = model }
+
 // Tools returns all tool definitions from the registry.
 func (p *BaseProfile) Tools() []tools.Definition {
 	if p.registry == nil {
@@ -170,6 +174,7 @@ func NewGeminiProfile(model string) *BaseProfile {
 	registry := tools.NewRegistry()
 	registerStandardTools(registry)
 	registerWebTools(registry)
+	registerReadManyFilesTool(registry)
 
 	return &BaseProfile{
 		id:                        "gemini-cli",
@@ -484,6 +489,32 @@ func registerApplyPatchTool(registry *tools.Registry) {
 					},
 				},
 				"required": []string{"patch"},
+			},
+		},
+	})
+}
+
+// registerReadManyFilesTool adds the read_many_files tool used by the Gemini
+// profile. Gemini's large context window makes it efficient to read multiple
+// files in a single tool call, reducing round-trips. The executor is nil
+// because the session layer provides a built-in handler.
+func registerReadManyFilesTool(registry *tools.Registry) {
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "read_many_files",
+			Description: "Read the contents of multiple files in a single operation. Returns each file's contents concatenated with file path headers. More efficient than multiple read_file calls.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"paths": map[string]any{
+						"type":        "array",
+						"description": "List of absolute file paths to read",
+						"items": map[string]any{
+							"type": "string",
+						},
+					},
+				},
+				"required": []string{"paths"},
 			},
 		},
 	})

@@ -7,6 +7,8 @@
 package types
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -526,4 +528,57 @@ type ModelInfo struct {
 	InputCostPerMillion  *float64 `json:"input_cost_per_million,omitempty"`
 	OutputCostPerMillion *float64 `json:"output_cost_per_million,omitempty"`
 	Aliases              []string `json:"aliases,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutConfig
+// ---------------------------------------------------------------------------
+
+// TimeoutConfig controls timeout behaviour for generate calls. Total applies
+// to the entire multi-step operation (including all tool loop iterations).
+// PerStep applies to each individual LLM call within the tool loop.
+type TimeoutConfig struct {
+	Total   time.Duration // Total timeout for entire generate call
+	PerStep time.Duration // Timeout per individual LLM call within tool loop
+}
+
+// ---------------------------------------------------------------------------
+// ToolContext
+// ---------------------------------------------------------------------------
+
+// ToolContext carries contextual information injected into tool execute
+// handlers. It allows tools to access the current conversation state,
+// cancellation signals, and the ID of the tool call being executed.
+type ToolContext struct {
+	// Messages is the current conversation history at the time of tool execution.
+	Messages []Message
+	// ToolCallID is the ID of the tool call being executed.
+	ToolCallID string
+	// Extra holds arbitrary caller-supplied context data.
+	Extra map[string]any
+}
+
+// ---------------------------------------------------------------------------
+// Tool name validation
+// ---------------------------------------------------------------------------
+
+// toolNameRegex matches valid tool names: starts with a letter, followed by
+// alphanumeric characters or underscores, with a maximum of 64 characters.
+var toolNameRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
+
+// ValidateToolName checks that the given tool name is a valid identifier
+// conforming to the spec: alphanumeric characters and underscores only,
+// must start with a letter, maximum 64 characters. This is the strictest
+// common subset across all LLM providers.
+func ValidateToolName(name string) error {
+	if name == "" {
+		return fmt.Errorf("tool name must not be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("tool name %q exceeds maximum length of 64 characters (got %d)", name, len(name))
+	}
+	if !toolNameRegex.MatchString(name) {
+		return fmt.Errorf("tool name %q is invalid: must start with a letter and contain only alphanumeric characters and underscores", name)
+	}
+	return nil
 }

@@ -597,7 +597,7 @@ func TestDefaultRegistry(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultRegistryFull(t *testing.T) {
-	reg := DefaultRegistryFull(nil, nil)
+	reg := DefaultRegistryFull(nil, nil, nil)
 
 	// Verify all expected handler types are registered.
 	typeTests := []struct {

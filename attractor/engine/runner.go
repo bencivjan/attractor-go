@@ -133,6 +133,24 @@ func (r *Runner) RunPipeline(ctx context.Context, name string, logsRoot string) 
 	return r.RunDOT(ctx, dotSource, logsRoot)
 }
 
+// ExecuteDOT implements handler.PipelineExecutor. It creates a child Runner
+// with the same registry and transforms, applies the given initial context,
+// and runs the DOT source through the full pipeline lifecycle. This method
+// is used by StackManagerLoopHandler to execute child pipelines.
+func (r *Runner) ExecuteDOT(ctx context.Context, dotSource string, logsRoot string, initialContext map[string]any) (*state.Outcome, error) {
+	child := &Runner{
+		Registry:       r.Registry,
+		Transforms:     r.Transforms,
+		OnEvent:        r.OnEvent,
+		MaxSteps:       r.MaxSteps,
+		InitialContext: initialContext,
+	}
+	return child.RunDOT(ctx, dotSource, logsRoot)
+}
+
+// Verify that Runner implements handler.PipelineExecutor at compile time.
+var _ handler.PipelineExecutor = (*Runner)(nil)
+
 // buildConfig creates an engine.Config from the runner's settings.
 func (r *Runner) buildConfig(logsRoot string) Config {
 	registry := r.Registry

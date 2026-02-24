@@ -149,7 +149,7 @@ func (h *MyHandler) Execute(ctx context.Context, node *graph.Node, pctx *state.C
 }
 
 // Register it
-registry := handler.DefaultRegistryFull(backend, interviewer)
+registry := handler.DefaultRegistryFull(backend, interviewer, nil)
 registry.Register("my_type", &MyHandler{})
 ```
 

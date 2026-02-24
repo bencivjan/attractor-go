@@ -433,7 +433,9 @@ func (s *Server) executePipeline(pr *PipelineRun, initialContext map[string]any)
 	webInterviewer := &WebInterviewer{run: pr}
 
 	// Build a per-run registry that uses the WebInterviewer for human gates.
-	registry := handler.DefaultRegistryFull(s.Backend, webInterviewer)
+	// We pass nil for the PipelineExecutor initially and set it after creating
+	// the runner, because the runner itself implements PipelineExecutor.
+	registry := handler.DefaultRegistryFull(s.Backend, webInterviewer, nil)
 
 	runner := &engine.Runner{
 		Registry:       registry,

@@ -386,6 +386,164 @@ func GenerateObject(ctx context.Context, opts GenerateOptions, schema map[string
 }
 
 // ---------------------------------------------------------------------------
+// StreamObject
+// ---------------------------------------------------------------------------
+
+// StreamObjectResult wraps a streaming structured output generation. As tokens
+// arrive, the accumulated text is periodically parsed to yield partial objects.
+// Call Partials() to iterate over partial parses; call Object() to block until
+// the final validated object is available.
+type StreamObjectResult struct {
+	partials chan map[string]any
+	done     chan struct{}
+	final    map[string]any
+	text     string
+	err      error
+	mu       sync.Mutex
+}
+
+// Partials returns a channel that yields progressively more complete parsed
+// objects as tokens arrive. The channel is closed when the stream ends.
+func (sor *StreamObjectResult) Partials() <-chan map[string]any {
+	return sor.partials
+}
+
+// Object blocks until the stream completes and returns the final validated
+// JSON object. Returns an error if the stream failed or output is invalid JSON.
+func (sor *StreamObjectResult) Object() (map[string]any, error) {
+	<-sor.done
+	sor.mu.Lock()
+	defer sor.mu.Unlock()
+	if sor.err != nil {
+		return nil, sor.err
+	}
+	return sor.final, nil
+}
+
+// Text blocks until the stream completes and returns the raw JSON text.
+func (sor *StreamObjectResult) Text() string {
+	<-sor.done
+	sor.mu.Lock()
+	defer sor.mu.Unlock()
+	return sor.text
+}
+
+// Err blocks until the stream completes and returns any error.
+func (sor *StreamObjectResult) Err() error {
+	<-sor.done
+	sor.mu.Lock()
+	defer sor.mu.Unlock()
+	return sor.err
+}
+
+// StreamObject streams structured output validated against a JSON schema.
+// It uses incremental JSON parsing to yield partial objects as tokens arrive,
+// enabling progressive UI rendering (spec Section 4.6).
+func StreamObject(ctx context.Context, opts GenerateOptions, schema map[string]any) (*StreamObjectResult, error) {
+	// Set up structured output via ResponseFormat.
+	opts.ResponseFormat = &types.ResponseFormat{
+		Type:       "json_schema",
+		JSONSchema: schema,
+		Strict:     true,
+	}
+
+	// Add system prompt if none set.
+	if opts.System == "" {
+		schemaBytes, err := json.Marshal(schema)
+		if err != nil {
+			return nil, types.NewSDKError("failed to marshal schema for system prompt", err)
+		}
+		opts.System = fmt.Sprintf(
+			"You must respond with valid JSON that conforms to the following JSON Schema. "+
+				"Do not include any text outside the JSON object.\n\nSchema:\n%s",
+			string(schemaBytes),
+		)
+	}
+
+	// Start the underlying stream.
+	sr, err := Stream(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	sor := &StreamObjectResult{
+		partials: make(chan map[string]any, 16),
+		done:     make(chan struct{}),
+	}
+
+	go func() {
+		defer close(sor.partials)
+		defer close(sor.done)
+
+		var accumulated strings.Builder
+		lastParsedLen := 0
+
+		for event := range sr.Events() {
+			if event.Type == types.StreamEventTextDelta {
+				accumulated.WriteString(event.Delta)
+
+				// Attempt incremental parse periodically (every 50+ new chars).
+				currentLen := accumulated.Len()
+				if currentLen-lastParsedLen >= 50 {
+					text := strings.TrimSpace(accumulated.String())
+					var partial map[string]any
+					if json.Unmarshal([]byte(text), &partial) == nil {
+						select {
+						case sor.partials <- partial:
+						case <-ctx.Done():
+							return
+						}
+						lastParsedLen = currentLen
+					}
+				}
+			}
+		}
+
+		// Final parse.
+		text := strings.TrimSpace(accumulated.String())
+
+		// Try extracting from markdown fences if needed.
+		var finalObj map[string]any
+		if err := json.Unmarshal([]byte(text), &finalObj); err != nil {
+			extracted := extractJSON(text)
+			if extracted != "" {
+				if jsonErr := json.Unmarshal([]byte(extracted), &finalObj); jsonErr == nil {
+					text = extracted
+				}
+			}
+		}
+
+		sor.mu.Lock()
+		sor.text = text
+		if finalObj != nil {
+			sor.final = finalObj
+			// Send the final complete object.
+			select {
+			case sor.partials <- finalObj:
+			default:
+			}
+		} else if text != "" {
+			sor.err = types.NewNoObjectGeneratedError(
+				fmt.Sprintf("stream produced text that is not valid JSON: %.100s...", text),
+				nil,
+			)
+		} else {
+			sor.err = types.NewNoObjectGeneratedError(
+				"stream produced empty output; expected JSON matching the provided schema",
+				nil,
+			)
+		}
+		// Also capture any stream-level error.
+		if streamErr := sr.Err(); streamErr != nil && sor.err == nil {
+			sor.err = streamErr
+		}
+		sor.mu.Unlock()
+	}()
+
+	return sor, nil
+}
+
+// ---------------------------------------------------------------------------
 // StreamAccumulator
 // ---------------------------------------------------------------------------
 

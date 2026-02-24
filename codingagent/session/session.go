@@ -234,6 +234,12 @@ func New(prof profile.ProviderProfile, execEnv env.ExecutionEnvironment, client 
 	}
 	s.subagents = newSubAgentManager(s)
 
+	// Apply profile-specific config overrides.
+	// Anthropic/Claude Code convention uses 120s default shell timeout.
+	if prof.ID() == "anthropic-claude" && s.Config.DefaultCommandTimeoutMs == 10000 {
+		s.Config.DefaultCommandTimeoutMs = 120000
+	}
+
 	// Generate cached context at session start per spec Section 6.3.
 	s.envContext = buildEnvironmentContext(execEnv, prof)
 	s.projectDocs = discoverProjectDocs(execEnv, prof.InstructionFileNames())

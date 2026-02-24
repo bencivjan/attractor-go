@@ -79,18 +79,22 @@ func Truncate(output string, maxChars int, mode Mode) string {
 		head := output[:headBudget]
 		tail := output[len(output)-tailBudget:]
 
-		marker := fmt.Sprintf("\n\n--- truncated %d characters ---\n\n", removed)
+		marker := fmt.Sprintf("\n\n[WARNING: Tool output was truncated. %d characters were removed from the middle. "+
+			"The full output is available in the event stream. "+
+			"If you need to see specific parts, re-run the tool with more targeted parameters.]\n\n", removed)
 		return head + marker + tail
 
 	case ModeTail:
 		tail := output[len(output)-maxChars:]
-		marker := fmt.Sprintf("--- truncated %d characters from beginning ---\n\n", removed)
+		marker := fmt.Sprintf("[WARNING: Tool output was truncated. First %d characters were removed. "+
+			"The full output is available in the event stream.]\n\n", removed)
 		return marker + tail
 
 	default:
 		// Unknown mode falls back to tail truncation.
 		tail := output[len(output)-maxChars:]
-		marker := fmt.Sprintf("--- truncated %d characters from beginning ---\n\n", removed)
+		marker := fmt.Sprintf("[WARNING: Tool output was truncated. First %d characters were removed. "+
+			"The full output is available in the event stream.]\n\n", removed)
 		return marker + tail
 	}
 }

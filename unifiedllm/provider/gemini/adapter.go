@@ -338,6 +338,11 @@ func (a *Adapter) buildRequestBody(req types.Request) (map[string]any, error) {
 					"allowedFunctionNames": []string{req.ToolChoice.ToolName},
 				},
 			}
+		default:
+			return nil, types.NewUnsupportedToolChoiceError(
+				fmt.Sprintf("Gemini does not support tool_choice mode %q", req.ToolChoice.Mode),
+				req.ToolChoice.Mode, nil,
+			)
 		}
 	}
 

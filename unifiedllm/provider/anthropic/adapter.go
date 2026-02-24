@@ -299,6 +299,11 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 				"type": "tool",
 				"name": req.ToolChoice.ToolName,
 			}
+		default:
+			return nil, types.NewUnsupportedToolChoiceError(
+				fmt.Sprintf("Anthropic does not support tool_choice mode %q", req.ToolChoice.Mode),
+				req.ToolChoice.Mode, nil,
+			)
 		}
 	}
 

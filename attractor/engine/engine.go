@@ -108,9 +108,11 @@ const (
 	EventCheckpointSaved    EventKind = "checkpoint_saved"
 	EventInterviewStarted   EventKind = "interview_started"
 	EventInterviewCompleted EventKind = "interview_completed"
-	EventParallelStarted    EventKind = "parallel_started"
-	EventParallelCompleted  EventKind = "parallel_completed"
-	EventPipelineFinalized  EventKind = "pipeline_finalized"
+	EventParallelStarted          EventKind = "parallel_started"
+	EventParallelCompleted        EventKind = "parallel_completed"
+	EventParallelBranchStarted   EventKind = "parallel_branch_started"
+	EventParallelBranchCompleted EventKind = "parallel_branch_completed"
+	EventPipelineFinalized        EventKind = "pipeline_finalized"
 )
 
 // Event is a structured lifecycle event emitted during pipeline execution.
@@ -330,7 +332,9 @@ func Run(ctx context.Context, g *graph.Graph, cfg Config) (*state.Outcome, error
 
 	if err != nil {
 		emit(cfg, Event{Kind: EventPipelineFailed, Timestamp: time.Now(), Data: map[string]any{
-			"error": err.Error(),
+			"error":          err.Error(),
+			"duration":       time.Since(startTime).Milliseconds(),
+			"artifact_count": countArtifacts(runDir),
 		}})
 		// Run finalization even on failure to ensure resources are released.
 		finalize(cfg)
@@ -338,7 +342,9 @@ func Run(ctx context.Context, g *graph.Graph, cfg Config) (*state.Outcome, error
 	}
 
 	emit(cfg, Event{Kind: EventPipelineCompleted, Timestamp: time.Now(), Data: map[string]any{
-		"status": string(outcome.Status),
+		"status":         string(outcome.Status),
+		"duration":       time.Since(startTime).Milliseconds(),
+		"artifact_count": countArtifacts(runDir),
 	}})
 
 	// FINALIZE phase: close open resources and invoke the finalization callback.
@@ -434,6 +440,11 @@ func executeLoop(
 
 		// Step 2a: Check if this is a terminal node.
 		if isTerminal(currentNode, g) {
+			// Set current_node so downstream consumers (checkpoints, context
+			// snapshots) know which terminal node was reached, consistent
+			// with the non-terminal path below.
+			pctx.Set("current_node", currentNode.ID)
+
 			allSatisfied, failedGate := checkGoalGates(g, pctx)
 			if allSatisfied {
 				// All goal gates satisfied (or none defined) -- pipeline complete.
@@ -500,6 +511,7 @@ func executeLoop(
 			"node":     currentNode.ID,
 			"label":    currentNode.Label(),
 			"step":     step,
+			"index":    stageStep,
 			"fidelity": string(mode),
 		}})
 
@@ -532,13 +544,16 @@ func executeLoop(
 
 		if outcome.Status == state.StatusFail {
 			emit(cfg, Event{Kind: EventStageFailed, Timestamp: time.Now(), Data: map[string]any{
-				"node":   currentNode.ID,
-				"reason": outcome.FailureReason,
+				"node":       currentNode.ID,
+				"reason":     outcome.FailureReason,
+				"index":      stageStep - 1,
+				"will_retry": false, // retries already exhausted at this point
 			}})
 		} else {
 			emit(cfg, Event{Kind: EventStageCompleted, Timestamp: time.Now(), Data: map[string]any{
 				"node":   currentNode.ID,
 				"status": string(outcome.Status),
+				"index":  stageStep - 1,
 			}})
 		}
 
@@ -863,18 +878,21 @@ func executeWithRetry(
 			break
 		}
 
+		// Calculate the backoff delay before emitting the event so we can
+		// include it in the event data.
+		delay := delayForAttempt(attempt, policy)
+
 		emit(cfg, Event{Kind: EventStageRetrying, Timestamp: time.Now(), Data: map[string]any{
-			"node":    node.ID,
-			"attempt": attempt + 1,
-			"status":  string(outcome.Status),
+			"node":       node.ID,
+			"attempt":    attempt + 1,
+			"status":     string(outcome.Status),
+			"will_retry": true,
+			"delay":      delay.Milliseconds(),
 		}})
 
 		// Store the current retry count in context so conditions and
 		// downstream handlers can inspect how many retries have occurred.
 		pctx.Set(fmt.Sprintf("internal.retry_count.%s", node.ID), attempt+1)
-
-		// Wait with backoff before retrying.
-		delay := delayForAttempt(attempt, policy)
 		select {
 		case <-ctx.Done():
 			return &state.Outcome{
@@ -974,6 +992,33 @@ func mirrorGraphAttributes(g *graph.Graph, pctx *state.Context) {
 	// via a dedicated context key, even if the graph attributes use a
 	// different key name internally.
 	pctx.Set("graph.goal", g.Goal())
+}
+
+// countArtifacts returns the number of artifact files in the run directory.
+// It counts files (not directories) in the run dir and its immediate
+// subdirectories. Returns 0 if the directory cannot be read.
+func countArtifacts(runDir string) int {
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			count++
+		} else {
+			// Count files in stage subdirectories.
+			subEntries, err := os.ReadDir(filepath.Join(runDir, entry.Name()))
+			if err == nil {
+				for _, sub := range subEntries {
+					if !sub.IsDir() {
+						count++
+					}
+				}
+			}
+		}
+	}
+	return count
 }
 
 // writeManifest writes a manifest.json into the run directory with pipeline

@@ -443,6 +443,11 @@ const (
 	ErrorIgnore
 )
 
+// BranchEventFunc is an optional callback invoked by ParallelHandler when
+// a parallel branch starts or completes. This allows the engine to emit
+// structured lifecycle events without introducing a circular import.
+type BranchEventFunc func(kind string, data map[string]any)
+
 // ParallelHandler fans out to branches concurrently and aggregates results
 // according to the node's join_policy and error_policy attributes.
 //
@@ -457,6 +462,8 @@ const (
 type ParallelHandler struct {
 	// registry is needed to resolve handlers for branch target nodes.
 	registry *Registry
+	// OnBranchEvent is an optional callback for parallel branch lifecycle events.
+	OnBranchEvent BranchEventFunc
 }
 
 // NewParallelHandler creates a ParallelHandler that uses the given registry
@@ -498,6 +505,15 @@ func (h *ParallelHandler) Execute(ctx context.Context, node *graph.Node, pctx *s
 			sem <- struct{}{}        // acquire semaphore slot
 			defer func() { <-sem }() // release semaphore slot
 
+			// Emit branch started event.
+			if h.OnBranchEvent != nil {
+				h.OnBranchEvent("parallel_branch_started", map[string]any{
+					"parent_node": node.ID,
+					"branch":      targetID,
+					"index":       idx,
+				})
+			}
+
 			branchCtx := pctx.Clone()
 
 			targetNode, ok := g.Nodes[targetID]
@@ -508,6 +524,15 @@ func (h *ParallelHandler) Execute(ctx context.Context, node *graph.Node, pctx *s
 						Status:        state.StatusFail,
 						FailureReason: fmt.Sprintf("target node '%s' not found", targetID),
 					},
+				}
+				// Emit branch completed event on failure.
+				if h.OnBranchEvent != nil {
+					h.OnBranchEvent("parallel_branch_completed", map[string]any{
+						"parent_node": node.ID,
+						"branch":      targetID,
+						"index":       idx,
+						"status":      "fail",
+					})
 				}
 				return
 			}
@@ -522,6 +547,16 @@ func (h *ParallelHandler) Execute(ctx context.Context, node *graph.Node, pctx *s
 			}
 
 			results[idx] = branchResult{id: targetID, outcome: outcome}
+
+			// Emit branch completed event.
+			if h.OnBranchEvent != nil {
+				h.OnBranchEvent("parallel_branch_completed", map[string]any{
+					"parent_node": node.ID,
+					"branch":      targetID,
+					"index":       idx,
+					"status":      string(outcome.Status),
+				})
+			}
 		}(i, edge.To)
 	}
 
@@ -619,7 +654,16 @@ func parseErrorPolicy(s string) ErrorPolicy {
 // best candidate by heuristic (success ranks highest, then lexical order),
 // and stores the winning branch ID in "parallel.fan_in.best_id" and its
 // outcome status in "parallel.fan_in.best_outcome".
-type FanInHandler struct{}
+//
+// When the node has a non-empty prompt attribute and a Backend is configured,
+// the handler delegates candidate ranking to the LLM instead of using the
+// heuristic. If the LLM call fails or no backend is available, it falls back
+// to the heuristic selection.
+type FanInHandler struct {
+	// Backend is an optional LLM backend used for intelligent candidate
+	// ranking when the fan-in node has a prompt attribute.
+	Backend CodergenBackend
+}
 
 // Execute reads parallel results and selects the best branch.
 func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.Context, _ *graph.Graph, _ string) (*state.Outcome, error) {
@@ -636,19 +680,51 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 	}
 
 	// Parse entries: "nodeId:status,nodeId:status,..."
-	type entry struct {
-		id     string
-		status string
-	}
-	var entries []entry
+	var entries []fanInEntry
 	for _, part := range strings.Split(resultsRaw, ",") {
 		parts := strings.SplitN(part, ":", 2)
 		if len(parts) == 2 {
-			entries = append(entries, entry{id: parts[0], status: parts[1]})
+			entries = append(entries, fanInEntry{id: parts[0], status: parts[1]})
 		}
 	}
 
-	// Rank by status: success=0, fail=1, other=2; break ties lexically by ID.
+	bestBranch, bestOutcome := h.selectBest(node, pctx, entries)
+
+	return &state.Outcome{
+		Status: state.StatusSuccess,
+		Notes:  fmt.Sprintf("Fan-in '%s': selected best branch '%s' from %d branches", node.ID, bestBranch, len(entries)),
+		ContextUpdates: map[string]any{
+			"parallel.fan_in.best_id":      bestBranch,
+			"parallel.fan_in.best_outcome": bestOutcome,
+			"last_stage":                   node.ID,
+		},
+	}, nil
+}
+
+// fanInEntry is used internally for candidate ranking.
+type fanInEntry struct {
+	id     string
+	status string
+}
+
+// selectBest picks the best branch from candidates. When the node has a
+// prompt and an LLM backend is available, it delegates to the LLM for
+// intelligent ranking. Otherwise it falls back to heuristic selection.
+func (h *FanInHandler) selectBest(node *graph.Node, pctx *state.Context, entries []fanInEntry) (string, string) {
+	// Try LLM-based evaluation if prompt is configured and backend is available.
+	if node.Prompt() != "" && h.Backend != nil {
+		bestID, bestStatus := h.llmSelectBest(node, pctx, entries)
+		if bestID != "" {
+			return bestID, bestStatus
+		}
+		// LLM evaluation failed; fall back to heuristic.
+	}
+	return heuristicSelectBest(entries)
+}
+
+// heuristicSelectBest ranks candidates by status (success > fail > other)
+// and breaks ties lexically by branch ID.
+func heuristicSelectBest(entries []fanInEntry) (string, string) {
 	bestBranch := ""
 	bestOutcome := ""
 	bestRank := 3
@@ -666,16 +742,47 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 			bestRank = rank
 		}
 	}
+	return bestBranch, bestOutcome
+}
 
-	return &state.Outcome{
-		Status: state.StatusSuccess,
-		Notes:  fmt.Sprintf("Fan-in '%s': selected best branch '%s' from %d branches", node.ID, bestBranch, len(entries)),
-		ContextUpdates: map[string]any{
-			"parallel.fan_in.best_id":      bestBranch,
-			"parallel.fan_in.best_outcome": bestOutcome,
-			"last_stage":                   node.ID,
-		},
-	}, nil
+// llmSelectBest uses the CodergenBackend to ask the LLM to pick the best
+// branch from the candidates. Returns empty strings if the LLM call fails.
+func (h *FanInHandler) llmSelectBest(node *graph.Node, pctx *state.Context, entries []fanInEntry) (string, string) {
+	// Build a prompt listing the candidates for the LLM to evaluate.
+	var sb strings.Builder
+	sb.WriteString(node.Prompt())
+	sb.WriteString("\n\nCandidates:\n")
+	entryMap := make(map[string]string, len(entries))
+	for i, e := range entries {
+		sb.WriteString(fmt.Sprintf("%d. Branch '%s' (status: %s)\n", i+1, e.id, e.status))
+		entryMap[e.id] = e.status
+	}
+	sb.WriteString("\nRespond with ONLY the branch ID of the best candidate.")
+
+	result, err := h.Backend.Run(node, sb.String(), pctx)
+	if err != nil {
+		return "", ""
+	}
+
+	responseText, ok := result.(string)
+	if !ok {
+		return "", ""
+	}
+
+	// Parse the LLM response: look for a branch ID in the response text.
+	trimmed := strings.TrimSpace(responseText)
+	for _, e := range entries {
+		if strings.Contains(trimmed, e.id) {
+			return e.id, e.status
+		}
+	}
+
+	// If the response exactly matches a branch ID, use it.
+	if status, found := entryMap[trimmed]; found {
+		return trimmed, status
+	}
+
+	return "", ""
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1302,7 @@ func DefaultRegistryFull(backend CodergenBackend, interv interviewer.Interviewer
 	r.Register("wait.human", &WaitForHumanHandler{Interviewer: interv})
 	r.Register("conditional", &ConditionalHandler{})
 	r.Register("parallel", NewParallelHandler(r))
-	r.Register("parallel.fan_in", &FanInHandler{})
+	r.Register("parallel.fan_in", &FanInHandler{Backend: backend})
 	r.Register("tool", &ToolHandler{})
 	r.Register("stack.manager_loop", &StackManagerLoopHandler{Executor: executor})
 	r.Register("communication", &CommunicationHandler{})

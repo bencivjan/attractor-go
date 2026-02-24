@@ -120,7 +120,7 @@ func TruncateLines(output string, maxLines int) string {
 	head := lines[:headLines]
 	tail := lines[len(lines)-tailLines:]
 
-	marker := fmt.Sprintf("\n--- truncated %d lines ---\n", removed)
+	marker := fmt.Sprintf("\n[... %d lines omitted ...]\n", removed)
 	return strings.Join(head, "\n") + marker + strings.Join(tail, "\n")
 }
 

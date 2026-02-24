@@ -333,6 +333,43 @@ func (h *WaitForHumanHandler) Execute(_ context.Context, node *graph.Node, _ *st
 
 	answer := h.Interviewer.Ask(question)
 
+	// Handle timeout and skipped answers by falling back to the node's
+	// default_choice attribute. If no default is configured, return FAIL.
+	if answer.Value == interviewer.AnswerTimeout || answer.Value == interviewer.AnswerSkipped {
+		defaultChoice := node.Attrs["human.default_choice"]
+		if defaultChoice == "" {
+			return &state.Outcome{
+				Status:        state.StatusFail,
+				FailureReason: fmt.Sprintf("Human gate '%s' %s with no default_choice", node.ID, string(answer.Value)),
+				ContextUpdates: map[string]any{
+					"human.gate.selected": string(answer.Value),
+				},
+			}, nil
+		}
+		// Use the default choice to select the edge.
+		var nextIDs []string
+		var defaultLabel string
+		for _, c := range choices {
+			if strings.EqualFold(c.option.Key, defaultChoice) {
+				nextIDs = append(nextIDs, c.targetID)
+				defaultLabel = c.option.Label
+			}
+		}
+		if defaultLabel == "" {
+			defaultLabel = defaultChoice
+		}
+		return &state.Outcome{
+			Status:           state.StatusSuccess,
+			PreferredLabel:   defaultLabel,
+			SuggestedNextIDs: nextIDs,
+			Notes:            fmt.Sprintf("Human gate '%s' %s, using default_choice: %s", node.ID, string(answer.Value), defaultLabel),
+			ContextUpdates: map[string]any{
+				"human.gate.selected": defaultChoice,
+				"human.gate.label":    defaultLabel,
+			},
+		}, nil
+	}
+
 	selectedKey := string(answer.Value)
 	selectedLabel := answer.Text
 	if answer.SelectedOption != nil {
@@ -440,7 +477,7 @@ func (h *ParallelHandler) Execute(ctx context.Context, node *graph.Node, pctx *s
 	}
 
 	joinPolicy := parseJoinPolicy(node.Attrs["join_policy"])
-	errorPolicy := parseErrorPolicy(node.Attrs["error_policy"])
+	_ = parseErrorPolicy(node.Attrs["error_policy"]) // parsed for future use by other join policies
 	maxParallel := attrIntDefault(node.Attrs, "max_parallel", 4)
 	kValue := attrIntDefault(node.Attrs, "k_value", 1)
 
@@ -511,13 +548,12 @@ func (h *ParallelHandler) Execute(ctx context.Context, node *graph.Node, pctx *s
 	case JoinWaitAll:
 		if failures == 0 {
 			aggregateStatus = state.StatusSuccess
+		} else if failures > 0 && failures < len(results) {
+			// Some branches failed but not all: partial success.
+			aggregateStatus = state.StatusPartialSuccess
 		} else {
-			switch errorPolicy {
-			case ErrorIgnore, ErrorContinue:
-				aggregateStatus = state.StatusSuccess
-			default:
-				aggregateStatus = state.StatusFail
-			}
+			// All branches failed.
+			aggregateStatus = state.StatusFail
 		}
 	case JoinFirstSuccess:
 		if successes > 0 {
@@ -581,7 +617,8 @@ func parseErrorPolicy(s string) ErrorPolicy {
 // FanInHandler consolidates parallel branch results. It reads
 // "parallel.results" from context (written by ParallelHandler), selects the
 // best candidate by heuristic (success ranks highest, then lexical order),
-// and stores the winning branch ID in "parallel.best_branch".
+// and stores the winning branch ID in "parallel.fan_in.best_id" and its
+// outcome status in "parallel.fan_in.best_outcome".
 type FanInHandler struct{}
 
 // Execute reads parallel results and selects the best branch.
@@ -592,7 +629,8 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 			Status: state.StatusSuccess,
 			Notes:  fmt.Sprintf("Fan-in '%s': no parallel results found", node.ID),
 			ContextUpdates: map[string]any{
-				"parallel.best_branch": "",
+				"parallel.fan_in.best_id":      "",
+				"parallel.fan_in.best_outcome": "",
 			},
 		}, nil
 	}
@@ -612,6 +650,7 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 
 	// Rank by status: success=0, fail=1, other=2; break ties lexically by ID.
 	bestBranch := ""
+	bestOutcome := ""
 	bestRank := 3
 	for _, e := range entries {
 		rank := 2
@@ -623,6 +662,7 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 		}
 		if rank < bestRank || (rank == bestRank && (bestBranch == "" || e.id < bestBranch)) {
 			bestBranch = e.id
+			bestOutcome = e.status
 			bestRank = rank
 		}
 	}
@@ -631,8 +671,9 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 		Status: state.StatusSuccess,
 		Notes:  fmt.Sprintf("Fan-in '%s': selected best branch '%s' from %d branches", node.ID, bestBranch, len(entries)),
 		ContextUpdates: map[string]any{
-			"parallel.best_branch": bestBranch,
-			"last_stage":           node.ID,
+			"parallel.fan_in.best_id":      bestBranch,
+			"parallel.fan_in.best_outcome": bestOutcome,
+			"last_stage":                   node.ID,
 		},
 	}, nil
 }
@@ -690,13 +731,22 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 		postHook = g.Attrs["tool_hooks.post"]
 	}
 
-	// Run pre-hook if configured.
+	// Run pre-hook if configured. A non-zero exit skips tool execution.
 	toolName := node.Attrs["tool_name"]
 	if toolName == "" {
 		toolName = node.ID
 	}
 	if preHook != "" {
-		runToolHook(preHook, node.ID, toolName, "")
+		if hookErr := runToolHook(preHook, node.ID, toolName, ""); hookErr != nil {
+			return &state.Outcome{
+				Status:        state.StatusFail,
+				FailureReason: fmt.Sprintf("Tool '%s' pre-hook failed: %v", node.ID, hookErr),
+				ContextUpdates: map[string]any{
+					"last_stage":     node.ID,
+					"tool.exit_code": "-1",
+				},
+			}, nil
+		}
 	}
 
 	// Build the command with a timeout derived from the parent context.
@@ -739,7 +789,7 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 
 		// Run post-hook on failure (best-effort).
 		if postHook != "" {
-			runToolHook(postHook, node.ID, toolName, truncStderr)
+			_ = runToolHook(postHook, node.ID, toolName, truncStderr)
 		}
 
 		return &state.Outcome{
@@ -760,7 +810,7 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 
 	// Run post-hook on success (best-effort).
 	if postHook != "" {
-		runToolHook(postHook, node.ID, toolName, truncStdout)
+		_ = runToolHook(postHook, node.ID, toolName, truncStdout)
 	}
 
 	return &state.Outcome{
@@ -768,7 +818,7 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 		Notes:  fmt.Sprintf("Tool '%s' completed (exit 0)", node.ID),
 		ContextUpdates: map[string]any{
 			"last_stage":     node.ID,
-			"tool.stdout":    truncStdout,
+			"tool.output":    truncStdout,
 			"tool.exit_code": "0",
 		},
 	}, nil
@@ -1168,11 +1218,11 @@ func DefaultRegistry(defaultHandler Handler) *Registry {
 // ---------------------------------------------------------------------------
 
 // runToolHook executes a shell command as a tool hook, passing NODE_ID,
-// TOOL_NAME, and optionally TOOL_RESULT as environment variables. Errors
-// are silently ignored because hooks are best-effort.
-func runToolHook(hookCmd, nodeID, toolName, result string) {
+// TOOL_NAME, and optionally TOOL_RESULT as environment variables. Returns
+// an error if the hook command exits with a non-zero status.
+func runToolHook(hookCmd, nodeID, toolName, result string) error {
 	if hookCmd == "" {
-		return
+		return nil
 	}
 	cmd := exec.Command("sh", "-c", hookCmd)
 	cmd.Env = append(os.Environ(),
@@ -1182,7 +1232,7 @@ func runToolHook(hookCmd, nodeID, toolName, result string) {
 	if result != "" {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TOOL_RESULT=%s", result))
 	}
-	_ = cmd.Run()
+	return cmd.Run()
 }
 
 // ---------------------------------------------------------------------------

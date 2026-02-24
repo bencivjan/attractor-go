@@ -125,9 +125,9 @@ func TruncateLines(output string, maxLines int) string {
 // 1. Character-based truncation using the tool's configured limit and mode.
 // 2. Line-based truncation using the tool's configured line limit.
 //
-// customCharLimits, if non-nil, override DefaultCharLimits for the given
-// tool name.
-func TruncateToolOutput(output, toolName string, customCharLimits map[string]int) string {
+// customCharLimits overrides DefaultCharLimits; customLineLimits overrides
+// DefaultLineLimits. Either may be nil to use defaults.
+func TruncateToolOutput(output, toolName string, customCharLimits, customLineLimits map[string]int) string {
 	if output == "" {
 		return output
 	}
@@ -152,7 +152,15 @@ func TruncateToolOutput(output, toolName string, customCharLimits map[string]int
 	result := Truncate(output, charLimit, mode)
 
 	// Step 2: line truncation.
-	if lineLimit, ok := DefaultLineLimits[toolName]; ok {
+	lineLimit := 0
+	if customLineLimits != nil {
+		if limit, ok := customLineLimits[toolName]; ok {
+			lineLimit = limit
+		}
+	} else if limit, ok := DefaultLineLimits[toolName]; ok {
+		lineLimit = limit
+	}
+	if lineLimit > 0 {
 		result = TruncateLines(result, lineLimit)
 	}
 

@@ -30,6 +30,7 @@ import (
 	"github.com/strongdm/attractor-go/codingagent/env"
 	"github.com/strongdm/attractor-go/codingagent/events"
 	"github.com/strongdm/attractor-go/codingagent/profile"
+	"github.com/strongdm/attractor-go/codingagent/tools"
 	"github.com/strongdm/attractor-go/codingagent/truncation"
 	"github.com/strongdm/attractor-go/unifiedllm/types"
 )
@@ -75,6 +76,9 @@ type Config struct {
 	// ToolOutputLimits overrides default character limits for tool output
 	// truncation, keyed by tool name.
 	ToolOutputLimits map[string]int
+	// ToolLineLimits overrides default line limits for tool output
+	// truncation, keyed by tool name. Applied after character truncation.
+	ToolLineLimits map[string]int
 	// EnableLoopDetection enables detection of repeating tool call patterns.
 	EnableLoopDetection bool
 	// LoopDetectionWindow is the number of recent tool rounds to examine for
@@ -700,7 +704,7 @@ func (s *Session) executeSingleTool(ctx context.Context, tc types.ToolCall) type
 	fullOutput := output
 
 	// Apply truncation for the LLM context.
-	output = truncation.TruncateToolOutput(output, tc.Name, s.Config.ToolOutputLimits)
+	output = truncation.TruncateToolOutput(output, tc.Name, s.Config.ToolOutputLimits, s.Config.ToolLineLimits)
 
 	durationMs := time.Since(startTime).Milliseconds()
 
@@ -812,6 +816,14 @@ func (s *Session) executeBuiltinTool(ctx context.Context, name string, args map[
 			return "", err
 		}
 		return formatDirEntries(entries), nil
+
+	case "apply_patch":
+		patch, _ := args["patch"].(string)
+		if patch == "" {
+			return "", fmt.Errorf("patch is required")
+		}
+		workDir := s.ExecutionEnv.WorkingDirectory()
+		return tools.ApplyPatch(patch, workDir)
 
 	default:
 		return "", fmt.Errorf("no built-in handler for tool %q", name)

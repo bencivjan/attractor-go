@@ -130,6 +130,7 @@ func NewAnthropicProfile(model string) *BaseProfile {
 func NewOpenAIProfile(model string) *BaseProfile {
 	registry := tools.NewRegistry()
 	registerStandardTools(registry)
+	registerApplyPatchTool(registry)
 
 	return &BaseProfile{
 		id:                        "openai-codex",
@@ -349,6 +350,29 @@ func registerStandardTools(registry *tools.Registry) {
 					},
 				},
 				"required": []string{"path"},
+			},
+		},
+	})
+}
+
+// registerApplyPatchTool adds the apply_patch tool (v4a format) used by the
+// OpenAI profile. OpenAI models are specifically trained on this format and
+// produce significantly better edits when using it.
+func registerApplyPatchTool(registry *tools.Registry) {
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name: "apply_patch",
+			Description: "Apply code changes using the v4a patch format. Supports creating, deleting, " +
+				"and modifying files in a single operation. Use this tool for all file edits.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"patch": map[string]any{
+						"type":        "string",
+						"description": "The patch content in v4a format (*** Begin Patch ... *** End Patch)",
+					},
+				},
+				"required": []string{"patch"},
 			},
 		},
 	})

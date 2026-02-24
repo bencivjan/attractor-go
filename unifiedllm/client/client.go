@@ -13,6 +13,9 @@ import (
 	"os"
 
 	"github.com/strongdm/attractor-go/unifiedllm/catalog"
+	"github.com/strongdm/attractor-go/unifiedllm/provider/anthropic"
+	"github.com/strongdm/attractor-go/unifiedllm/provider/gemini"
+	"github.com/strongdm/attractor-go/unifiedllm/provider/openai"
 	"github.com/strongdm/attractor-go/unifiedllm/types"
 )
 
@@ -99,37 +102,44 @@ func FromEnv() (*Client, error) {
 		providers: make(map[string]ProviderAdapter),
 	}
 
-	// Track registration order so the first provider becomes default.
-	var firstProvider string
-
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-		_ = key
-		firstProvider = "openai"
-	}
-
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-		_ = key
-		if firstProvider == "" {
-			firstProvider = "anthropic"
+	if os.Getenv("OPENAI_API_KEY") != "" {
+		adapter, err := openai.FromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("initializing OpenAI adapter: %w", err)
+		}
+		c.providers["openai"] = adapter
+		if c.defaultProvider == "" {
+			c.defaultProvider = "openai"
 		}
 	}
 
-	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
-		_ = key
-		if firstProvider == "" {
-			firstProvider = "gemini"
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		adapter, err := anthropic.FromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("initializing Anthropic adapter: %w", err)
+		}
+		c.providers["anthropic"] = adapter
+		if c.defaultProvider == "" {
+			c.defaultProvider = "anthropic"
 		}
 	}
 
-	if len(c.providers) == 0 && firstProvider == "" {
+	if os.Getenv("GEMINI_API_KEY") != "" {
+		adapter, err := gemini.FromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("initializing Gemini adapter: %w", err)
+		}
+		c.providers["gemini"] = adapter
+		if c.defaultProvider == "" {
+			c.defaultProvider = "gemini"
+		}
+	}
+
+	if len(c.providers) == 0 {
 		return nil, types.NewConfigurationError(
 			"no LLM provider API keys found in environment; set at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY",
 			nil,
 		)
-	}
-
-	if c.defaultProvider == "" {
-		c.defaultProvider = firstProvider
 	}
 
 	return c, nil

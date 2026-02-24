@@ -8,6 +8,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -24,6 +25,7 @@ import (
 	"github.com/strongdm/attractor-go/attractor/handler"
 	"github.com/strongdm/attractor-go/attractor/state"
 	"github.com/strongdm/attractor-go/attractor/validation"
+	llmtypes "github.com/strongdm/attractor-go/unifiedllm/types"
 )
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,10 @@ type RetryPolicy struct {
 }
 
 // defaultRetryPolicy returns a sensible baseline retry policy.
+// The default ShouldRetry predicate classifies errors by HTTP status code:
+//   - 429 (rate limit) and 5xx (server errors) are retryable
+//   - 400, 401, 403 are not retryable (client errors)
+//   - All other errors default to retryable
 func defaultRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:   3,
@@ -140,7 +146,30 @@ func defaultRetryPolicy() RetryPolicy {
 		BackoffFactor: 2.0,
 		MaxDelay:      60 * time.Second,
 		Jitter:        true,
+		ShouldRetry:   defaultShouldRetry,
 	}
+}
+
+// defaultShouldRetry determines whether an error is retryable based on its
+// HTTP status code. It extracts the ProviderError from the error chain to
+// inspect the status code. Returns true for HTTP 429 and 5xx, false for
+// HTTP 400, 401, 403, and true for all other errors (including non-HTTP
+// errors) as a conservative default.
+func defaultShouldRetry(err error) bool {
+	var providerErr *llmtypes.ProviderError
+	if errors.As(err, &providerErr) {
+		code := providerErr.StatusCode
+		switch {
+		case code == 429:
+			return true
+		case code >= 500 && code < 600:
+			return true
+		case code == 400, code == 401, code == 403:
+			return false
+		}
+	}
+	// Default: treat unknown errors as retryable.
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -755,11 +784,17 @@ func checkGoalGates(g *graph.Graph, pctx *state.Context) (bool, *graph.Node) {
 }
 
 // getRetryTarget resolves the retry target for a failed goal gate node.
-// Resolution order: node-level retry_target, graph-level retry_target,
-// graph-level fallback_retry_target.
+// Resolution order (4 steps per spec):
+//  1. node.RetryTarget()
+//  2. node.FallbackRetryTarget()
+//  3. graph.RetryTarget()
+//  4. graph.FallbackRetryTarget()
 func getRetryTarget(node *graph.Node, g *graph.Graph) string {
 	if node != nil {
 		if target := node.RetryTarget(); target != "" {
+			return target
+		}
+		if target := node.FallbackRetryTarget(); target != "" {
 			return target
 		}
 	}
@@ -809,6 +844,12 @@ func executeWithRetry(
 			}
 		}
 
+		// auto_status enforcement: when a handler returns an outcome with no
+		// explicit status and the node has auto_status=true, default to SUCCESS.
+		if outcome.Status == "" && node.AutoStatus() {
+			outcome.Status = state.StatusSuccess
+		}
+
 		lastOutcome = outcome
 
 		// Check whether we should retry.
@@ -838,6 +879,12 @@ func executeWithRetry(
 			}
 		case <-time.After(delay):
 		}
+	}
+
+	// allow_partial enforcement: when retries are exhausted and the outcome
+	// is FAIL, upgrade to PARTIAL_SUCCESS if the node allows partial results.
+	if lastOutcome != nil && lastOutcome.Status == state.StatusFail && node.AllowPartial() {
+		lastOutcome.Status = state.StatusPartialSuccess
 	}
 
 	return lastOutcome

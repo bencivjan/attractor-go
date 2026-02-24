@@ -402,18 +402,32 @@ func (a *Adapter) buildUserInput(msg types.Message) map[string]any {
 			})
 		case types.ContentKindImage:
 			if cp.Image != nil {
-				if cp.Image.URL != "" {
+				// Auto-resolve local file paths to base64 data.
+				img, resolveErr := types.AutoResolveImage(cp.Image)
+				if resolveErr != nil {
 					parts = append(parts, map[string]any{
-						"type":      "input_image",
-						"image_url": cp.Image.URL,
+						"type": "input_text",
+						"text": fmt.Sprintf("[Failed to resolve image: %v]", resolveErr),
 					})
-				} else if len(cp.Image.Data) > 0 {
+				} else if img.URL != "" {
 					parts = append(parts, map[string]any{
 						"type":      "input_image",
-						"image_url": fmt.Sprintf("data:%s;base64,%s", cp.Image.MediaType, encodeBase64(cp.Image.Data)),
+						"image_url": img.URL,
+					})
+				} else if len(img.Data) > 0 {
+					parts = append(parts, map[string]any{
+						"type":      "input_image",
+						"image_url": fmt.Sprintf("data:%s;base64,%s", img.MediaType, encodeBase64(img.Data)),
 					})
 				}
 			}
+		case types.ContentKindAudio:
+			// Audio content is not supported by the OpenAI Responses API.
+			// Replace with a text placeholder so the model is aware content was omitted.
+			parts = append(parts, map[string]any{
+				"type": "input_text",
+				"text": "[Audio content not supported by this provider]",
+			})
 		}
 	}
 

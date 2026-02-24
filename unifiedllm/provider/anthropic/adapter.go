@@ -217,11 +217,30 @@ func (a *Adapter) Close() error {
 // Request building
 // ---------------------------------------------------------------------------
 
+// autoCacheEnabled checks whether automatic cache_control injection is enabled.
+// It defaults to true unless provider_options["anthropic"]["auto_cache"] is
+// explicitly set to false.
+func autoCacheEnabled(providerOptions map[string]any) bool {
+	if providerOptions == nil {
+		return true
+	}
+	anthropicOpts, ok := providerOptions["anthropic"].(map[string]any)
+	if !ok {
+		return true
+	}
+	if autoCache, ok := anthropicOpts["auto_cache"].(bool); ok {
+		return autoCache
+	}
+	return true
+}
+
 // buildRequestBody translates a unified Request into the Anthropic Messages API format.
 func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]any, error) {
 	body := map[string]any{
 		"model": req.Model,
 	}
+
+	cacheEnabled := autoCacheEnabled(req.ProviderOptions)
 
 	// Extract system messages.
 	var systemParts []map[string]any
@@ -239,15 +258,17 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 	}
 
 	if len(systemParts) > 0 {
-		// Inject cache_control on the last system block for prompt caching.
-		// This allows Anthropic to cache the system prompt across turns,
-		// reducing input token costs by up to 90% for agentic workloads.
-		systemParts[len(systemParts)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+		if cacheEnabled {
+			// Inject cache_control on the last system block for prompt caching.
+			// This allows Anthropic to cache the system prompt across turns,
+			// reducing input token costs by up to 90% for agentic workloads.
+			systemParts[len(systemParts)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+		}
 		body["system"] = systemParts
 	}
 
 	// Build messages with alternation enforcement.
-	apiMessages, err := a.buildMessages(messages)
+	apiMessages, err := a.buildMessages(messages, cacheEnabled)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +303,7 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 		// Inject cache_control on the last tool definition for prompt caching.
 		// This allows Anthropic to cache the tool definitions across turns,
 		// complementing the system prompt and conversation caching.
-		if len(tools) > 0 {
+		if cacheEnabled && len(tools) > 0 {
 			tools[len(tools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
 		}
 		body["tools"] = tools
@@ -372,8 +393,9 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 
 // buildMessages enforces Anthropic's strict user/assistant alternation by
 // merging consecutive same-role messages. Tool results are placed in user
-// messages with tool_result content blocks.
-func (a *Adapter) buildMessages(messages []types.Message) ([]map[string]any, error) {
+// messages with tool_result content blocks. When cacheEnabled is true,
+// cache_control breakpoints are injected on the conversation prefix.
+func (a *Adapter) buildMessages(messages []types.Message, cacheEnabled bool) ([]map[string]any, error) {
 	if len(messages) == 0 {
 		return nil, nil
 	}
@@ -426,7 +448,9 @@ func (a *Adapter) buildMessages(messages []types.Message) ([]map[string]any, err
 	// Inject cache_control on the last user-role message. This creates a
 	// cache breakpoint at the conversation prefix boundary, allowing all
 	// prior turns to be cached across agentic loop iterations.
-	injectConversationCacheBreakpoint(result)
+	if cacheEnabled {
+		injectConversationCacheBreakpoint(result)
+	}
 
 	return result, nil
 }
@@ -482,25 +506,40 @@ func (a *Adapter) buildUserMessage(msg types.Message) map[string]any {
 			})
 		case types.ContentKindImage:
 			if cp.Image != nil {
-				if cp.Image.URL != "" {
+				// Auto-resolve local file paths to base64 data.
+				img, resolveErr := types.AutoResolveImage(cp.Image)
+				if resolveErr != nil {
+					// Skip the image but continue building the message.
+					parts = append(parts, map[string]any{
+						"type": "text",
+						"text": fmt.Sprintf("[Failed to resolve image: %v]", resolveErr),
+					})
+				} else if img.URL != "" {
 					parts = append(parts, map[string]any{
 						"type": "image",
 						"source": map[string]any{
 							"type": "url",
-							"url":  cp.Image.URL,
+							"url":  img.URL,
 						},
 					})
-				} else if len(cp.Image.Data) > 0 {
+				} else if len(img.Data) > 0 {
 					parts = append(parts, map[string]any{
 						"type": "image",
 						"source": map[string]any{
 							"type":       "base64",
-							"media_type": cp.Image.MediaType,
-							"data":       encodeBase64(cp.Image.Data),
+							"media_type": img.MediaType,
+							"data":       encodeBase64(img.Data),
 						},
 					})
 				}
 			}
+		case types.ContentKindAudio:
+			// Audio content is not supported by the Anthropic API. Replace with
+			// a text placeholder so the model is aware content was omitted.
+			parts = append(parts, map[string]any{
+				"type": "text",
+				"text": "[Audio content not supported by this provider]",
+			})
 		case types.ContentKindDocument:
 			if cp.Document != nil && len(cp.Document.Data) > 0 {
 				parts = append(parts, map[string]any{

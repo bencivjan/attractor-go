@@ -449,6 +449,7 @@ const (
 	StreamEventToolCallStart  StreamEventType = "tool_call_start"
 	StreamEventToolCallDelta  StreamEventType = "tool_call_delta"
 	StreamEventToolCallEnd    StreamEventType = "tool_call_end"
+	StreamEventStepFinish     StreamEventType = "step_finish"
 	StreamEventFinish         StreamEventType = "finish"
 	StreamEventError          StreamEventType = "error"
 	StreamEventProviderEvent  StreamEventType = "provider_event"
@@ -631,5 +632,70 @@ func ImageFromFile(path string) (*ContentPart, error) {
 			Data:      []byte(encoded),
 			MediaType: mimeType,
 		},
+	}, nil
+}
+
+// isLocalFilePath returns true if the URL looks like a local file path rather
+// than a remote URL. It checks for paths starting with /, ./, or ~/.
+func isLocalFilePath(url string) bool {
+	return strings.HasPrefix(url, "/") ||
+		strings.HasPrefix(url, "./") ||
+		strings.HasPrefix(url, "~/")
+}
+
+// expandTilde replaces a leading ~ with the user's home directory.
+func expandTilde(path string) string {
+	if !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[2:])
+}
+
+// AutoResolveImage checks if an ImageData's URL is a local file path and, if
+// so, reads the file from disk, base64-encodes the contents, and returns a new
+// ImageData with the Data and MediaType fields populated. If the URL is not a
+// local path (i.e. it is an HTTP URL or the Data field is already populated),
+// the original ImageData is returned unmodified.
+//
+// Local paths are detected by a leading /, ./, or ~/ prefix.
+func AutoResolveImage(img *ImageData) (*ImageData, error) {
+	if img == nil {
+		return img, nil
+	}
+
+	// If data is already populated, no resolution needed.
+	if len(img.Data) > 0 {
+		return img, nil
+	}
+
+	// If URL is not a local file path, return as-is.
+	if img.URL == "" || !isLocalFilePath(img.URL) {
+		return img, nil
+	}
+
+	// Resolve the local file path.
+	path := expandTilde(img.URL)
+
+	ext := strings.ToLower(filepath.Ext(path))
+	mimeType, ok := imageExtToMIME[ext]
+	if !ok {
+		return nil, fmt.Errorf("unsupported image extension %q in local path %q (supported: png, jpg, jpeg, gif, webp)", ext, path)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read image file %q: %w", path, err)
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+
+	return &ImageData{
+		Data:      []byte(encoded),
+		MediaType: mimeType,
+		Detail:    img.Detail,
 	}, nil
 }

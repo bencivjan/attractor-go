@@ -428,22 +428,34 @@ func (a *Adapter) buildUserContent(msg types.Message) map[string]any {
 			})
 		case types.ContentKindImage:
 			if cp.Image != nil {
-				if len(cp.Image.Data) > 0 {
+				// Auto-resolve local file paths to base64 data.
+				img, resolveErr := types.AutoResolveImage(cp.Image)
+				if resolveErr != nil {
+					parts = append(parts, map[string]any{
+						"text": fmt.Sprintf("[Failed to resolve image: %v]", resolveErr),
+					})
+				} else if len(img.Data) > 0 {
 					parts = append(parts, map[string]any{
 						"inlineData": map[string]any{
-							"mimeType": cp.Image.MediaType,
-							"data":     encodeBase64(cp.Image.Data),
+							"mimeType": img.MediaType,
+							"data":     encodeBase64(img.Data),
 						},
 					})
-				} else if cp.Image.URL != "" {
+				} else if img.URL != "" {
 					parts = append(parts, map[string]any{
 						"fileData": map[string]any{
-							"mimeType": cp.Image.MediaType,
-							"fileUri":  cp.Image.URL,
+							"mimeType": img.MediaType,
+							"fileUri":  img.URL,
 						},
 					})
 				}
 			}
+		case types.ContentKindAudio:
+			// Audio content is not supported by the Gemini generateContent API.
+			// Replace with a text placeholder so the model is aware content was omitted.
+			parts = append(parts, map[string]any{
+				"text": "[Audio content not supported by this provider]",
+			})
 		}
 	}
 

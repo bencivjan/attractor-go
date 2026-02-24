@@ -39,6 +39,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    true,
 		InputCostPerMillion:  floatPtr(15.0),
 		OutputCostPerMillion: floatPtr(75.0),
+		Aliases:              []string{"opus", "claude-opus"},
 	},
 	{
 		ID:                   "claude-sonnet-4-5",
@@ -51,6 +52,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    true,
 		InputCostPerMillion:  floatPtr(3.0),
 		OutputCostPerMillion: floatPtr(15.0),
+		Aliases:              []string{"sonnet", "claude-sonnet"},
 	},
 	{
 		ID:                   "claude-haiku-4-5",
@@ -63,6 +65,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    false,
 		InputCostPerMillion:  floatPtr(0.80),
 		OutputCostPerMillion: floatPtr(4.0),
+		Aliases:              []string{"haiku", "claude-haiku"},
 	},
 
 	// -------------------------------------------------------------------------
@@ -79,6 +82,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    true,
 		InputCostPerMillion:  floatPtr(2.50),
 		OutputCostPerMillion: floatPtr(10.0),
+		Aliases:              []string{"gpt5", "gpt-5"},
 	},
 	{
 		ID:                   "gpt-5.2-mini",
@@ -131,6 +135,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    true,
 		InputCostPerMillion:  floatPtr(1.25),
 		OutputCostPerMillion: floatPtr(5.0),
+		Aliases:              []string{"gemini-pro", "gemini-3-pro"},
 	},
 	{
 		ID:                   "gemini-3-flash-preview",
@@ -143,6 +148,7 @@ var Models = []types.ModelInfo{
 		SupportsReasoning:    true,
 		InputCostPerMillion:  floatPtr(0.075),
 		OutputCostPerMillion: floatPtr(0.30),
+		Aliases:              []string{"gemini-flash", "gemini-3-flash"},
 	},
 }
 

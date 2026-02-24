@@ -163,6 +163,11 @@ type GenerateResult struct {
 	// Reasoning is the concatenated reasoning/thinking content from the final response.
 	Reasoning string
 
+	// Output holds the parsed structured output from GenerateObject. It is nil
+	// for plain Generate calls. When set, it contains the unmarshaled JSON
+	// object produced by GenerateObject.
+	Output any
+
 	// ToolCalls contains the tool calls from the final response (if any remained unexecuted).
 	ToolCalls []types.ToolCall
 
@@ -198,6 +203,10 @@ type StepResult struct {
 
 	// ToolResults contains the results from executing tool calls in this step.
 	ToolResults []types.ToolResult
+
+	// Warnings contains non-fatal issues encountered during this step, such
+	// as unsupported content types that were gracefully skipped.
+	Warnings []string
 
 	// FinishReason indicates why this step's generation stopped.
 	FinishReason types.FinishReason
@@ -277,6 +286,7 @@ type StreamResult struct {
 	resp   *types.Response
 	mu     sync.Mutex
 	err    error
+	acc    *StreamAccumulator
 }
 
 // Events returns the channel of stream events. Read from this channel to
@@ -301,6 +311,41 @@ func (sr *StreamResult) Err() error {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.err
+}
+
+// TextStream returns a channel that yields only text deltas from the stream.
+// It reads from the Events channel and filters for StreamEventTextDelta events,
+// forwarding only the delta string. The returned channel is closed when the
+// events channel is exhausted. This method should only be called once; calling
+// it consumes events from the shared Events channel.
+func (sr *StreamResult) TextStream() <-chan string {
+	ch := make(chan string, 64)
+	go func() {
+		defer close(ch)
+		for event := range sr.events {
+			// Feed the internal accumulator so PartialResponse stays current.
+			sr.mu.Lock()
+			sr.acc.Process(event)
+			sr.mu.Unlock()
+
+			if event.Type == types.StreamEventTextDelta {
+				ch <- event.Delta
+			}
+		}
+	}()
+	return ch
+}
+
+// PartialResponse returns the current accumulated state of the stream as a
+// Response. This can be called at any time during streaming to get a snapshot
+// of the response so far. Returns nil if no events have been processed yet.
+// Note: PartialResponse only reflects events that have been consumed. If using
+// TextStream(), events are consumed automatically. If using Events() directly,
+// call ProcessEvent() or use the accumulator manually.
+func (sr *StreamResult) PartialResponse() *types.Response {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.acc.Response()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +392,7 @@ func Stream(ctx context.Context, opts GenerateOptions) (*StreamResult, error) {
 	sr := &StreamResult{
 		events: make(chan types.StreamEvent, 64),
 		done:   make(chan struct{}),
+		acc:    NewStreamAccumulator(),
 	}
 
 	go func() {
@@ -425,6 +471,7 @@ func GenerateObject(ctx context.Context, opts GenerateOptions, schema map[string
 		if extracted != "" {
 			if jsonErr := json.Unmarshal([]byte(extracted), &parsed); jsonErr == nil {
 				result.Text = extracted
+				result.Output = parsed
 				return result, nil
 			}
 		}
@@ -435,6 +482,7 @@ func GenerateObject(ctx context.Context, opts GenerateOptions, schema map[string
 	}
 
 	result.Text = text
+	result.Output = parsed
 	return result, nil
 }
 
@@ -1062,6 +1110,16 @@ func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, lo
 					contentStr,
 					tr.IsError,
 				))
+			}
+
+			// Emit a synthetic step_finish event to signal the boundary
+			// between tool execution rounds in the stream.
+			select {
+			case out <- types.StreamEvent{
+				Type: types.StreamEventStepFinish,
+			}:
+			case <-ctx.Done():
+				return types.NewAbortError("context cancelled while emitting step_finish event", ctx.Err())
 			}
 
 			// Continue to the next round (which will start a new stream).

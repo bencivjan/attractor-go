@@ -16,6 +16,7 @@ import (
 	"github.com/strongdm/attractor-go/unifiedllm/provider/anthropic"
 	"github.com/strongdm/attractor-go/unifiedllm/provider/gemini"
 	"github.com/strongdm/attractor-go/unifiedllm/provider/openai"
+	"github.com/strongdm/attractor-go/unifiedllm/provider/openaicompat"
 	"github.com/strongdm/attractor-go/unifiedllm/types"
 )
 
@@ -136,6 +137,18 @@ func FromEnv() (*Client, error) {
 		c.providers["gemini"] = adapter
 		if c.defaultProvider == "" {
 			c.defaultProvider = "gemini"
+		}
+	}
+
+	// OpenAI-compatible third-party endpoints.
+	if os.Getenv("OPENAI_COMPAT_API_KEY") != "" && os.Getenv("OPENAI_COMPAT_BASE_URL") != "" {
+		adapter, err := openaicompat.FromEnv()
+		if err != nil {
+			return nil, fmt.Errorf("initializing OpenAI-compatible adapter: %w", err)
+		}
+		c.providers["openai-compat"] = adapter
+		if c.defaultProvider == "" {
+			c.defaultProvider = "openai-compat"
 		}
 	}
 

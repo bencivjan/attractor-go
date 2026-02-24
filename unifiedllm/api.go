@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/strongdm/attractor-go/unifiedllm/client"
 	"github.com/strongdm/attractor-go/unifiedllm/retry"
@@ -130,6 +131,22 @@ type GenerateOptions struct {
 	// on individual LLM calls (not whole operations). Default: 2.
 	MaxRetries int
 
+	// Timeout configures timeout behaviour for the generate call. Total applies
+	// to the entire multi-step operation. PerStep applies to each individual
+	// LLM call within the tool loop. Nil means no timeout.
+	Timeout *types.TimeoutConfig
+
+	// ToolContext carries contextual information injected into tool execute
+	// handlers. This allows tools to access the current conversation, the
+	// cancellation signal (via context), and the tool call ID.
+	ToolContext map[string]any
+
+	// StopWhen is an optional custom stop condition evaluated after each LLM
+	// response in the tool loop. If it returns true, the loop breaks early
+	// and the current result is returned. This is useful for implementing
+	// custom convergence checks or resource budgets.
+	StopWhen func(response *types.Response) bool
+
 	// Client overrides the default client for this call.
 	Client *client.Client
 }
@@ -218,12 +235,28 @@ func Generate(ctx context.Context, opts GenerateOptions) (*GenerateResult, error
 		return nil, err
 	}
 
+	// Apply total timeout to the entire operation if configured.
+	if opts.Timeout != nil && opts.Timeout.Total > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout.Total)
+		defer cancel()
+	}
+
 	maxRounds := opts.MaxToolRounds
 	if maxRounds <= 0 && hasExecutableTools(opts.Tools) {
 		maxRounds = 1
 	}
 
-	steps, err := toolLoop(ctx, c, req, opts.Tools, maxRounds, buildRetryPolicy(opts.MaxRetries))
+	loopOpts := toolLoopOptions{
+		tools:       opts.Tools,
+		maxRounds:   maxRounds,
+		retryPolicy: buildRetryPolicy(opts.MaxRetries),
+		perStep:     perStepTimeout(opts.Timeout),
+		toolContext:  opts.ToolContext,
+		stopWhen:    opts.StopWhen,
+	}
+
+	steps, err := toolLoop(ctx, c, req, loopOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -289,9 +322,26 @@ func Stream(ctx context.Context, opts GenerateOptions) (*StreamResult, error) {
 		return nil, err
 	}
 
+	// Apply total timeout to the entire operation if configured.
+	// The cancel function is deferred inside the goroutine to ensure the
+	// timeout context lives for the full duration of the stream.
+	var totalCancel context.CancelFunc
+	if opts.Timeout != nil && opts.Timeout.Total > 0 {
+		ctx, totalCancel = context.WithTimeout(ctx, opts.Timeout.Total)
+	}
+
 	maxRounds := opts.MaxToolRounds
 	if maxRounds <= 0 && hasExecutableTools(opts.Tools) {
 		maxRounds = 1
+	}
+
+	loopOpts := toolLoopOptions{
+		tools:       opts.Tools,
+		maxRounds:   maxRounds,
+		retryPolicy: buildRetryPolicy(opts.MaxRetries),
+		perStep:     perStepTimeout(opts.Timeout),
+		toolContext:  opts.ToolContext,
+		stopWhen:    opts.StopWhen,
 	}
 
 	sr := &StreamResult{
@@ -302,8 +352,11 @@ func Stream(ctx context.Context, opts GenerateOptions) (*StreamResult, error) {
 	go func() {
 		defer close(sr.events)
 		defer close(sr.done)
+		if totalCancel != nil {
+			defer totalCancel()
+		}
 
-		streamErr := streamToolLoop(ctx, c, req, opts.Tools, maxRounds, sr.events)
+		streamErr := streamToolLoop(ctx, c, req, loopOpts, sr.events)
 		sr.mu.Lock()
 		sr.err = streamErr
 		sr.mu.Unlock()
@@ -737,10 +790,16 @@ func buildRequest(opts GenerateOptions) (types.Request, error) {
 
 	req.Messages = messages
 
-	// Convert Tool definitions.
+	// Validate and convert Tool definitions.
 	if len(opts.Tools) > 0 {
 		defs := make([]types.ToolDefinition, len(opts.Tools))
 		for i, t := range opts.Tools {
+			if err := types.ValidateToolName(t.Name); err != nil {
+				return types.Request{}, types.NewConfigurationError(
+					fmt.Sprintf("invalid tool at index %d: %v", i, err),
+					err,
+				)
+			}
 			defs[i] = t.Definition()
 		}
 		req.Tools = defs
@@ -758,14 +817,38 @@ func buildRetryPolicy(maxRetries int) retry.Policy {
 	return p
 }
 
-// hasExecutableTools returns true if any tool has an Execute handler.
+// hasExecutableTools returns true if any tool has an Execute or
+// ExecuteWithContext handler.
 func hasExecutableTools(tools []types.Tool) bool {
 	for _, t := range tools {
-		if t.Execute != nil {
+		if t.Execute != nil || t.ExecuteWithContext != nil {
 			return true
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Internal: tool loop options
+// ---------------------------------------------------------------------------
+
+// toolLoopOptions bundles parameters passed to toolLoop and streamToolLoop.
+type toolLoopOptions struct {
+	tools       []types.Tool
+	maxRounds   int
+	retryPolicy retry.Policy
+	perStep     time.Duration
+	toolContext  map[string]any
+	stopWhen    func(response *types.Response) bool
+}
+
+// perStepTimeout extracts the PerStep duration from a TimeoutConfig, returning
+// zero if the config is nil or PerStep is not set.
+func perStepTimeout(tc *types.TimeoutConfig) time.Duration {
+	if tc == nil {
+		return 0
+	}
+	return tc.PerStep
 }
 
 // ---------------------------------------------------------------------------
@@ -781,9 +864,9 @@ func hasExecutableTools(tools []types.Tool) bool {
 //     rounds remain, it executes the tools, appends tool result messages to
 //     the conversation, and loops.
 //  4. Otherwise, it returns the accumulated steps.
-func toolLoop(ctx context.Context, c *client.Client, req types.Request, tools []types.Tool, maxRounds int, retryPolicy retry.Policy) ([]StepResult, error) {
+func toolLoop(ctx context.Context, c *client.Client, req types.Request, loopOpts toolLoopOptions) ([]StepResult, error) {
 	var steps []StepResult
-	toolMap := buildToolMap(tools)
+	toolMap := buildToolMap(loopOpts.tools)
 
 	for round := 0; ; round++ {
 		// Check context before each LLM call.
@@ -791,12 +874,25 @@ func toolLoop(ctx context.Context, c *client.Client, req types.Request, tools []
 			return steps, types.NewAbortError("context cancelled during tool loop", err)
 		}
 
+		// Apply per-step timeout to the individual LLM call if configured.
+		stepCtx := ctx
+		if loopOpts.perStep > 0 {
+			var stepCancel context.CancelFunc
+			stepCtx, stepCancel = context.WithTimeout(ctx, loopOpts.perStep)
+			defer stepCancel()
+		}
+
 		// Call the LLM with retry wrapping individual calls.
-		resp, err := retry.Do(ctx, retryPolicy, func() (*types.Response, error) {
-			return c.Complete(ctx, req)
+		resp, err := retry.Do(stepCtx, loopOpts.retryPolicy, func() (*types.Response, error) {
+			return c.Complete(stepCtx, req)
 		})
 		if err != nil {
 			return steps, err
+		}
+
+		// Check context after LLM call completes.
+		if err := ctx.Err(); err != nil {
+			return steps, types.NewAbortError("context cancelled after LLM call in tool loop", err)
 		}
 
 		// Extract tool calls and text from the response.
@@ -813,10 +909,22 @@ func toolLoop(ctx context.Context, c *client.Client, req types.Request, tools []
 		// Determine if we should execute tools this round.
 		executableCalls := filterExecutableCalls(respToolCalls, toolMap)
 
-		if len(executableCalls) > 0 && round < maxRounds {
-			// Execute all tool calls concurrently.
-			toolResults := executeAllTools(toolMap, executableCalls)
+		if len(executableCalls) > 0 && round < loopOpts.maxRounds {
+			// Build tool context for this round's executions.
+			toolCtx := &types.ToolContext{
+				Messages: req.Messages,
+				Extra:    loopOpts.toolContext,
+			}
+
+			// Execute all tool calls concurrently with context injection.
+			toolResults := executeAllTools(ctx, toolMap, executableCalls, toolCtx)
 			step.ToolResults = toolResults
+
+			// Check context after tool execution.
+			if err := ctx.Err(); err != nil {
+				steps = append(steps, step)
+				return steps, types.NewAbortError("context cancelled after tool execution in tool loop", err)
+			}
 
 			// Append the assistant message (with tool calls) to the conversation.
 			req.Messages = append(req.Messages, resp.Message)
@@ -832,6 +940,12 @@ func toolLoop(ctx context.Context, c *client.Client, req types.Request, tools []
 			}
 
 			steps = append(steps, step)
+
+			// Check custom stop condition after tool execution.
+			if loopOpts.stopWhen != nil && loopOpts.stopWhen(resp) {
+				break
+			}
+
 			continue
 		}
 
@@ -850,8 +964,8 @@ func toolLoop(ctx context.Context, c *client.Client, req types.Request, tools []
 // streamToolLoop runs the streaming generation with tool loop support. Events
 // are forwarded to the output channel. During tool execution rounds, the
 // stream pauses while tools run and then resumes with the next LLM call.
-func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, tools []types.Tool, maxRounds int, out chan<- types.StreamEvent) error {
-	toolMap := buildToolMap(tools)
+func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, loopOpts toolLoopOptions, out chan<- types.StreamEvent) error {
+	toolMap := buildToolMap(loopOpts.tools)
 
 	for round := 0; ; round++ {
 		if err := ctx.Err(); err != nil {
@@ -862,8 +976,16 @@ func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, to
 			return types.NewAbortError("context cancelled during stream tool loop", err)
 		}
 
+		// Apply per-step timeout if configured.
+		stepCtx := ctx
+		if loopOpts.perStep > 0 {
+			var stepCancel context.CancelFunc
+			stepCtx, stepCancel = context.WithTimeout(ctx, loopOpts.perStep)
+			defer stepCancel()
+		}
+
 		// Start the stream.
-		eventCh, err := c.Stream(ctx, req)
+		eventCh, err := c.Stream(stepCtx, req)
 		if err != nil {
 			out <- types.StreamEvent{
 				Type:  types.StreamEventError,
@@ -895,9 +1017,19 @@ func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, to
 			return streamErr
 		}
 
+		// Check context after stream completes.
+		if err := ctx.Err(); err != nil {
+			return types.NewAbortError("context cancelled after stream completed in tool loop", err)
+		}
+
 		// Get the accumulated response.
 		resp := acc.Response()
 		if resp == nil {
+			return nil
+		}
+
+		// Check custom stop condition.
+		if loopOpts.stopWhen != nil && loopOpts.stopWhen(resp) {
 			return nil
 		}
 
@@ -905,9 +1037,20 @@ func streamToolLoop(ctx context.Context, c *client.Client, req types.Request, to
 		respToolCalls := extractToolCalls(resp)
 		executableCalls := filterExecutableCalls(respToolCalls, toolMap)
 
-		if len(executableCalls) > 0 && round < maxRounds {
-			// Execute tools.
-			toolResults := executeAllTools(toolMap, executableCalls)
+		if len(executableCalls) > 0 && round < loopOpts.maxRounds {
+			// Build tool context for this round's executions.
+			toolCtx := &types.ToolContext{
+				Messages: req.Messages,
+				Extra:    loopOpts.toolContext,
+			}
+
+			// Execute tools with context injection.
+			toolResults := executeAllTools(ctx, toolMap, executableCalls, toolCtx)
+
+			// Check context after tool execution.
+			if err := ctx.Err(); err != nil {
+				return types.NewAbortError("context cancelled after tool execution in stream tool loop", err)
+			}
 
 			// Append assistant message and tool results to conversation.
 			req.Messages = append(req.Messages, resp.Message)
@@ -964,11 +1107,11 @@ func extractToolCalls(resp *types.Response) []types.ToolCall {
 }
 
 // filterExecutableCalls returns only the tool calls that have a matching tool
-// with an Execute handler.
+// with an Execute or ExecuteWithContext handler.
 func filterExecutableCalls(calls []types.ToolCall, toolMap map[string]types.Tool) []types.ToolCall {
 	var executable []types.ToolCall
 	for _, tc := range calls {
-		if tool, ok := toolMap[tc.Name]; ok && tool.Execute != nil {
+		if tool, ok := toolMap[tc.Name]; ok && (tool.Execute != nil || tool.ExecuteWithContext != nil) {
 			executable = append(executable, tc)
 		}
 	}
@@ -978,8 +1121,10 @@ func filterExecutableCalls(calls []types.ToolCall, toolMap map[string]types.Tool
 // executeAllTools executes tool calls concurrently using goroutines and a
 // WaitGroup. Each tool call is dispatched to its corresponding Execute handler.
 // Results are collected in order. If a tool is not found or has no handler, an
-// error result is returned for that call.
-func executeAllTools(toolMap map[string]types.Tool, toolCalls []types.ToolCall) []types.ToolResult {
+// error result is returned for that call. The toolCtx provides contextual
+// information (conversation history, tool call IDs, caller-supplied extras)
+// that is available to tool handlers that accept it.
+func executeAllTools(ctx context.Context, toolMap map[string]types.Tool, toolCalls []types.ToolCall, toolCtx *types.ToolContext) []types.ToolResult {
 	results := make([]types.ToolResult, len(toolCalls))
 	var wg sync.WaitGroup
 
@@ -988,8 +1133,18 @@ func executeAllTools(toolMap map[string]types.Tool, toolCalls []types.ToolCall) 
 		go func(idx int, call types.ToolCall) {
 			defer wg.Done()
 
+			// Check for abort before starting tool execution.
+			if ctx.Err() != nil {
+				results[idx] = types.ToolResult{
+					ToolCallID: call.ID,
+					Content:    "error: context cancelled before tool execution",
+					IsError:    true,
+				}
+				return
+			}
+
 			tool, ok := toolMap[call.Name]
-			if !ok || tool.Execute == nil {
+			if !ok || (tool.Execute == nil && tool.ExecuteWithContext == nil) {
 				results[idx] = types.ToolResult{
 					ToolCallID: call.ID,
 					Content:    fmt.Sprintf("error: tool %q not found or has no execute handler", call.Name),
@@ -998,9 +1153,20 @@ func executeAllTools(toolMap map[string]types.Tool, toolCalls []types.ToolCall) 
 				return
 			}
 
+			// Prepare arguments with injected tool context. The tool call
+			// ID is set per-call while the rest of the context is shared.
+			var execToolCtx *types.ToolContext
+			if toolCtx != nil {
+				execToolCtx = &types.ToolContext{
+					Messages:   toolCtx.Messages,
+					ToolCallID: call.ID,
+					Extra:      toolCtx.Extra,
+				}
+			}
+
 			// Execute the tool, recovering from panics to prevent one tool
 			// from crashing the entire loop.
-			content, err := safeExecuteTool(tool, call.Arguments)
+			content, err := safeExecuteTool(tool, call.Arguments, execToolCtx)
 			if err != nil {
 				results[idx] = types.ToolResult{
 					ToolCallID: call.ID,
@@ -1022,14 +1188,19 @@ func executeAllTools(toolMap map[string]types.Tool, toolCalls []types.ToolCall) 
 	return results
 }
 
-// safeExecuteTool calls a tool's Execute handler and recovers from panics,
-// converting them to errors.
-func safeExecuteTool(tool types.Tool, args map[string]any) (result string, err error) {
+// safeExecuteTool calls a tool's execute handler and recovers from panics,
+// converting them to errors. If the tool has an ExecuteWithContext handler,
+// it is preferred over the plain Execute handler, and the ToolContext is
+// passed through for context injection.
+func safeExecuteTool(tool types.Tool, args map[string]any, toolCtx *types.ToolContext) (result string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in tool %q: %v", tool.Name, r)
 		}
 	}()
+	if tool.ExecuteWithContext != nil {
+		return tool.ExecuteWithContext(args, toolCtx)
+	}
 	return tool.Execute(args)
 }
 

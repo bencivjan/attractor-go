@@ -475,11 +475,20 @@ type StreamEvent struct {
 // Tool is a high-level tool definition that pairs a schema with an execution
 // handler. Use this when building agentic loops that automatically dispatch
 // tool calls.
+//
+// Two handler fields are available:
+//   - Execute: simple handler that receives only the parsed arguments.
+//   - ExecuteWithContext: context-aware handler that also receives a ToolContext
+//     containing the current conversation, tool call ID, and caller-supplied extras.
+//
+// If both are set, ExecuteWithContext takes precedence. At least one must be
+// non-nil for the tool to participate in automatic execution.
 type Tool struct {
-	Name        string                                    `json:"name"`
-	Description string                                    `json:"description"`
-	Parameters  map[string]any                            `json:"parameters,omitempty"`
-	Execute     func(args map[string]any) (string, error) `json:"-"`
+	Name               string                                                    `json:"name"`
+	Description        string                                                    `json:"description"`
+	Parameters         map[string]any                                            `json:"parameters,omitempty"`
+	Execute            func(args map[string]any) (string, error)                 `json:"-"`
+	ExecuteWithContext func(args map[string]any, tc *ToolContext) (string, error) `json:"-"`
 }
 
 // Definition converts a Tool into a ToolDefinition suitable for inclusion in

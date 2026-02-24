@@ -349,8 +349,32 @@ func (a *Adapter) buildRequestBody(req types.Request) (map[string]any, error) {
 		}
 	}
 
-	// Pass through provider-specific options.
+	// Gemini grounding: if provider_options["gemini"]["grounding"] is set,
+	// add the grounding configuration to the tools array. This enables
+	// Google Search grounding for responses.
+	if geminiOpts, ok := req.ProviderOptions["gemini"].(map[string]any); ok {
+		if grounding, ok := geminiOpts["grounding"]; ok && grounding != nil {
+			groundingEntry, isMap := grounding.(map[string]any)
+			if !isMap {
+				// Default: enable Google Search grounding with no extra config.
+				groundingEntry = map[string]any{}
+			}
+
+			toolsSlice, _ := body["tools"].([]map[string]any)
+			toolsSlice = append(toolsSlice, map[string]any{
+				"googleSearch": groundingEntry,
+			})
+			body["tools"] = toolsSlice
+		}
+	}
+
+	// Pass through remaining provider-specific options. The "gemini" key
+	// is handled above for grounding, so all other keys are forwarded
+	// directly to the API body.
 	for k, v := range req.ProviderOptions {
+		if k == "gemini" {
+			continue
+		}
 		body[k] = v
 	}
 

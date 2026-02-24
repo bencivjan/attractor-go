@@ -393,13 +393,20 @@ func TestFanInHandler(t *testing.T) {
 	if outcome.Status != state.StatusSuccess {
 		t.Errorf("expected success, got %q", outcome.Status)
 	}
-	bestBranch, ok := outcome.ContextUpdates["parallel.best_branch"].(string)
+	bestBranch, ok := outcome.ContextUpdates["parallel.fan_in.best_id"].(string)
 	if !ok {
-		t.Fatal("expected parallel.best_branch in context updates")
+		t.Fatal("expected parallel.fan_in.best_id in context updates")
 	}
 	// branchB and branchC both succeeded, lexical tiebreak should pick branchB.
 	if bestBranch != "branchB" {
 		t.Errorf("expected best branch 'branchB', got %q", bestBranch)
+	}
+	bestOutcome, ok := outcome.ContextUpdates["parallel.fan_in.best_outcome"].(string)
+	if !ok {
+		t.Fatal("expected parallel.fan_in.best_outcome in context updates")
+	}
+	if bestOutcome != "success" {
+		t.Errorf("expected best outcome 'success', got %q", bestOutcome)
 	}
 }
 
@@ -442,9 +449,9 @@ func TestToolHandler_Echo(t *testing.T) {
 	if outcome.Status != state.StatusSuccess {
 		t.Errorf("expected success, got %q", outcome.Status)
 	}
-	stdout, ok := outcome.ContextUpdates["tool.stdout"].(string)
+	stdout, ok := outcome.ContextUpdates["tool.output"].(string)
 	if !ok {
-		t.Fatal("expected tool.stdout in context updates")
+		t.Fatal("expected tool.output in context updates")
 	}
 	if !strings.Contains(stdout, "hello") {
 		t.Errorf("expected stdout to contain 'hello', got %q", stdout)

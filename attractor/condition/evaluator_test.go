@@ -192,11 +192,29 @@ func TestEvaluate_BoolContextValue(t *testing.T) {
 	}
 }
 
-func TestEvaluate_MalformedClauseReturnsFalse(t *testing.T) {
-	// A malformed clause (no operator) evaluates to false.
+func TestEvaluate_BareKeyTruthiness(t *testing.T) {
 	o := outcome(state.StatusSuccess, "")
+
+	// A bare key with no matching context value resolves to empty string -> falsy.
 	if Evaluate("just_a_word", o, nil) {
-		t.Error("malformed clause without operator should evaluate to false")
+		t.Error("bare key with nil context should evaluate to false (empty)")
+	}
+
+	// A bare key that exists in context with a non-empty value -> truthy.
+	ctx := ctxWith("just_a_word", "present")
+	if !Evaluate("just_a_word", o, ctx) {
+		t.Error("bare key with non-empty context value should evaluate to true")
+	}
+
+	// A bare key that exists in context but is empty string -> falsy.
+	ctx2 := ctxWith("empty_key", "")
+	if Evaluate("empty_key", o, ctx2) {
+		t.Error("bare key with empty context value should evaluate to false")
+	}
+
+	// "outcome" as a bare key truthiness check: outcome is "success" (non-empty) -> truthy.
+	if !Evaluate("outcome", o, nil) {
+		t.Error("bare key 'outcome' should be truthy when outcome status is non-empty")
 	}
 }
 
@@ -230,7 +248,6 @@ func TestParseCondition_Invalid(t *testing.T) {
 		name      string
 		condition string
 	}{
-		{"no operator", "justAWord"},
 		{"empty clause in conjunction", "outcome=success && "},
 		{"empty key", "=value"},
 		{"empty value", "key="},
@@ -239,6 +256,25 @@ func TestParseCondition_Invalid(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := ParseCondition(tt.condition); err == nil {
 				t.Errorf("ParseCondition(%q) expected error, got nil", tt.condition)
+			}
+		})
+	}
+}
+
+func TestParseCondition_BareKeyIsValid(t *testing.T) {
+	// Bare keys (no operator) are valid as truthiness checks.
+	tests := []struct {
+		name      string
+		condition string
+	}{
+		{"simple bare key", "justAWord"},
+		{"bare key with dots", "context.foo"},
+		{"bare key in conjunction", "outcome=success && some_flag"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ParseCondition(tt.condition); err != nil {
+				t.Errorf("ParseCondition(%q) unexpected error: %v", tt.condition, err)
 			}
 		})
 	}

@@ -259,8 +259,8 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 			input = append(input, item)
 
 		case types.RoleAssistant:
-			item := a.buildAssistantInput(msg)
-			input = append(input, item)
+			items := a.buildAssistantInput(msg)
+			input = append(input, items...)
 
 		case types.RoleTool:
 			items := a.buildToolResultInputs(msg)
@@ -276,19 +276,18 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 		body["input"] = input
 	}
 
-	// Tools
+	// Tools — Responses API expects name/description/parameters at the top
+	// level of each tool object (not nested under "function").
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, tool := range req.Tools {
 			t := map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        tool.Name,
-					"description": tool.Description,
-				},
+				"type":        "function",
+				"name":        tool.Name,
+				"description": tool.Description,
 			}
 			if tool.Parameters != nil {
-				t["function"].(map[string]any)["parameters"] = tool.Parameters
+				t["parameters"] = tool.Parameters
 			}
 			tools = append(tools, t)
 		}
@@ -307,9 +306,7 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 		case "named":
 			body["tool_choice"] = map[string]any{
 				"type": "function",
-				"function": map[string]any{
-					"name": req.ToolChoice.ToolName,
-				},
+				"name": req.ToolChoice.ToolName,
 			}
 		}
 	}
@@ -419,27 +416,29 @@ func (a *Adapter) buildUserInput(msg types.Message) map[string]any {
 	return item
 }
 
-// buildAssistantInput constructs a Responses API input item for an assistant message.
-func (a *Adapter) buildAssistantInput(msg types.Message) map[string]any {
-	item := map[string]any{
-		"role": "assistant",
-	}
+// buildAssistantInput constructs Responses API input items for an assistant
+// message. In the Responses API, text content stays in the assistant message
+// item, but function_call items must be top-level entries in the input array.
+func (a *Adapter) buildAssistantInput(msg types.Message) []map[string]any {
+	var items []map[string]any
 
-	// Build content parts for the assistant output.
-	var parts []map[string]any
+	// Separate text content from function calls.
+	var textParts []map[string]any
+	var funcCalls []map[string]any
+
 	for _, cp := range msg.Content {
 		switch cp.Kind {
 		case types.ContentKindText:
-			parts = append(parts, map[string]any{
+			textParts = append(textParts, map[string]any{
 				"type": "output_text",
 				"text": cp.Text,
 			})
 		case types.ContentKindToolCall:
 			if cp.ToolCall != nil {
 				argJSON, _ := json.Marshal(cp.ToolCall.Arguments)
-				parts = append(parts, map[string]any{
+				funcCalls = append(funcCalls, map[string]any{
 					"type":      "function_call",
-					"id":        cp.ToolCall.ID,
+					"call_id":   cp.ToolCall.ID,
 					"name":      cp.ToolCall.Name,
 					"arguments": string(argJSON),
 				})
@@ -447,13 +446,21 @@ func (a *Adapter) buildAssistantInput(msg types.Message) map[string]any {
 		}
 	}
 
-	if len(parts) == 1 && parts[0]["type"] == "output_text" {
-		item["content"] = parts[0]["text"]
-	} else if len(parts) > 0 {
-		item["content"] = parts
+	// Build the assistant message item with text content.
+	if len(textParts) > 0 || len(funcCalls) == 0 {
+		item := map[string]any{"role": "assistant"}
+		if len(textParts) == 1 {
+			item["content"] = textParts[0]["text"]
+		} else if len(textParts) > 0 {
+			item["content"] = textParts
+		}
+		items = append(items, item)
 	}
 
-	return item
+	// Function calls are top-level input items in the Responses API.
+	items = append(items, funcCalls...)
+
+	return items
 }
 
 // buildToolResultInputs constructs Responses API input items for tool results.
@@ -519,11 +526,15 @@ func (a *Adapter) parseResponse(body map[string]any) (*types.Response, error) {
 			a.parseMessageOutput(itemMap, resp)
 
 		case "function_call":
-			// Tool call output item.
+			// Tool call output item. The Responses API uses call_id to link
+			// function_call outputs with function_call_output items. Fall back
+			// to id if call_id is missing.
 			tc := types.ToolCallData{
 				Type: "function",
 			}
-			if id, ok := itemMap["id"].(string); ok {
+			if callID, ok := itemMap["call_id"].(string); ok {
+				tc.ID = callID
+			} else if id, ok := itemMap["id"].(string); ok {
 				tc.ID = id
 			}
 			if name, ok := itemMap["name"].(string); ok {

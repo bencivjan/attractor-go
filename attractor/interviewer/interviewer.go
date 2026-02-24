@@ -6,9 +6,15 @@
 package interviewer
 
 import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -172,6 +178,202 @@ func (a *AutoApproveInterviewer) AskMultiple(questions []Question) []Answer {
 
 // Inform is a no-op for the auto-approve interviewer.
 func (a *AutoApproveInterviewer) Inform(message, stage string) {}
+
+// ---------------------------------------------------------------------------
+// ConsoleInterviewer
+// ---------------------------------------------------------------------------
+
+// ConsoleInterviewer reads from standard input and writes to standard output.
+// It displays formatted prompts with option keys and supports timeout via a
+// non-blocking read goroutine. This is the primary interactive implementation
+// for CLI-based pipeline runs.
+type ConsoleInterviewer struct {
+	Reader io.Reader // defaults to os.Stdin
+	Writer io.Writer // defaults to os.Stdout
+}
+
+// reader returns the configured reader, defaulting to os.Stdin.
+func (c *ConsoleInterviewer) reader() io.Reader {
+	if c.Reader != nil {
+		return c.Reader
+	}
+	return os.Stdin
+}
+
+// writer returns the configured writer, defaulting to os.Stdout.
+func (c *ConsoleInterviewer) writer() io.Writer {
+	if c.Writer != nil {
+		return c.Writer
+	}
+	return os.Stdout
+}
+
+// readLine reads a single line from the reader. If timeoutSec > 0, a
+// goroutine is used to enforce the deadline. Returns the trimmed line, or
+// an empty string on timeout/error.
+func (c *ConsoleInterviewer) readLine(timeoutSec float64) (string, bool) {
+	type result struct {
+		line string
+		ok   bool
+	}
+	ch := make(chan result, 1)
+
+	go func() {
+		scanner := bufio.NewScanner(c.reader())
+		if scanner.Scan() {
+			ch <- result{line: strings.TrimSpace(scanner.Text()), ok: true}
+		} else {
+			ch <- result{ok: false}
+		}
+	}()
+
+	if timeoutSec > 0 {
+		timer := time.NewTimer(time.Duration(timeoutSec * float64(time.Second)))
+		defer timer.Stop()
+		select {
+		case r := <-ch:
+			return r.line, r.ok
+		case <-timer.C:
+			return "", false
+		}
+	}
+
+	r := <-ch
+	return r.line, r.ok
+}
+
+// Ask presents a single question to the console and blocks until an answer
+// is available or the question times out.
+func (c *ConsoleInterviewer) Ask(q Question) Answer {
+	w := c.writer()
+
+	switch q.Type {
+	case QuestionYesNo:
+		fmt.Fprintf(w, "[Y/N] %s\n", q.Text)
+		line, ok := c.readLine(q.TimeoutSeconds)
+		if !ok {
+			if q.Default != nil {
+				return *q.Default
+			}
+			return TimeoutAnswer
+		}
+		lower := strings.ToLower(line)
+		if lower == "y" || lower == "yes" {
+			return YesAnswer
+		}
+		if lower == "n" || lower == "no" {
+			return NoAnswer
+		}
+		// Unrecognized input: fall back to default if available.
+		if q.Default != nil {
+			return *q.Default
+		}
+		return NoAnswer
+
+	case QuestionMultipleChoice:
+		fmt.Fprintf(w, "[?] %s\n", q.Text)
+		for i, opt := range q.Options {
+			fmt.Fprintf(w, "  %d. [%s] %s\n", i+1, opt.Key, opt.Label)
+		}
+		fmt.Fprint(w, "Select: ")
+		line, ok := c.readLine(q.TimeoutSeconds)
+		if !ok {
+			if q.Default != nil {
+				return *q.Default
+			}
+			return TimeoutAnswer
+		}
+		// Try matching by number.
+		if num, err := strconv.Atoi(line); err == nil && num >= 1 && num <= len(q.Options) {
+			opt := q.Options[num-1]
+			return Answer{
+				Value:          AnswerValue(opt.Key),
+				SelectedOption: &opt,
+				Text:           opt.Label,
+			}
+		}
+		// Try matching by accelerator key (case-insensitive).
+		upper := strings.ToUpper(line)
+		for _, opt := range q.Options {
+			if strings.ToUpper(opt.Key) == upper {
+				return Answer{
+					Value:          AnswerValue(opt.Key),
+					SelectedOption: &opt,
+					Text:           opt.Label,
+				}
+			}
+		}
+		// No match: fall back to default or first option.
+		if q.Default != nil {
+			return *q.Default
+		}
+		if len(q.Options) > 0 {
+			opt := q.Options[0]
+			return Answer{
+				Value:          AnswerValue(opt.Key),
+				SelectedOption: &opt,
+				Text:           opt.Label,
+			}
+		}
+		return SkippedAnswer
+
+	case QuestionFreeform:
+		fmt.Fprintf(w, "[?] %s\n> ", q.Text)
+		line, ok := c.readLine(q.TimeoutSeconds)
+		if !ok {
+			if q.Default != nil {
+				return *q.Default
+			}
+			return TimeoutAnswer
+		}
+		return Answer{Text: line}
+
+	case QuestionConfirmation:
+		fmt.Fprintf(w, "%s [Enter to confirm, N to cancel]\n", q.Text)
+		line, ok := c.readLine(q.TimeoutSeconds)
+		if !ok {
+			if q.Default != nil {
+				return *q.Default
+			}
+			return TimeoutAnswer
+		}
+		lower := strings.ToLower(line)
+		if lower == "n" || lower == "no" {
+			return NoAnswer
+		}
+		return YesAnswer
+
+	default:
+		fmt.Fprintf(w, "[?] %s\n> ", q.Text)
+		line, ok := c.readLine(q.TimeoutSeconds)
+		if !ok {
+			if q.Default != nil {
+				return *q.Default
+			}
+			return TimeoutAnswer
+		}
+		return Answer{Text: line}
+	}
+}
+
+// AskMultiple answers each question sequentially using Ask.
+func (c *ConsoleInterviewer) AskMultiple(questions []Question) []Answer {
+	answers := make([]Answer, len(questions))
+	for i, q := range questions {
+		answers[i] = c.Ask(q)
+	}
+	return answers
+}
+
+// Inform prints an informational message to the writer.
+func (c *ConsoleInterviewer) Inform(message, stage string) {
+	w := c.writer()
+	if stage != "" {
+		fmt.Fprintf(w, "[%s] %s\n", stage, message)
+	} else {
+		fmt.Fprintf(w, "%s\n", message)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // QueueInterviewer

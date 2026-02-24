@@ -83,10 +83,12 @@ func (m *SubAgentManager) Spawn(ctx context.Context, task string, workingDir str
 	m.counter++
 	agentID := fmt.Sprintf("agent-%s-%d", m.parent.ID[:8], m.counter)
 
-	// Build child config.
+	// Build child config. The max_turns parameter from spawn_agent maps to
+	// MaxTurns (total turns limit), not MaxToolRoundsPerInput (rounds per
+	// single input), because the subagent processes a single task as one input.
 	childCfg := m.parent.Config
 	if maxTurns > 0 {
-		childCfg.MaxToolRoundsPerInput = maxTurns
+		childCfg.MaxTurns = maxTurns
 	}
 
 	// Resolve profile. If model override is specified and differs from the

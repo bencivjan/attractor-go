@@ -18,14 +18,50 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// EnvVarPolicy
+// ---------------------------------------------------------------------------
+
+// EnvVarPolicy controls which host environment variables are inherited by
+// child shell commands.
+type EnvVarPolicy int
+
+const (
+	// EnvInheritAll passes all env vars except filtered sensitive ones.
+	// This is the default for backward compatibility.
+	EnvInheritAll EnvVarPolicy = iota
+	// EnvInheritCore only passes core development vars (PATH, HOME, USER,
+	// SHELL, LANG, TERM, TMPDIR, GOPATH, CARGO_HOME, NVM_DIR) plus any
+	// non-sensitive vars.
+	EnvInheritCore
+	// EnvInheritNone passes no env vars except PATH.
+	EnvInheritNone
+)
+
+// coreEnvVars is the set of environment variable names considered essential
+// for development workflows. Used by EnvInheritCore policy.
+var coreEnvVars = map[string]bool{
+	"PATH":       true,
+	"HOME":       true,
+	"USER":       true,
+	"SHELL":      true,
+	"LANG":       true,
+	"TERM":       true,
+	"TMPDIR":     true,
+	"GOPATH":     true,
+	"CARGO_HOME": true,
+	"NVM_DIR":    true,
+}
+
+// ---------------------------------------------------------------------------
 // LocalEnvironment
 // ---------------------------------------------------------------------------
 
 // LocalEnvironment executes everything on the host machine.
 type LocalEnvironment struct {
-	workDir   string
-	platform  string
-	osVersion string
+	workDir      string
+	platform     string
+	osVersion    string
+	EnvVarPolicy EnvVarPolicy
 }
 
 // NewLocalEnvironment creates a LocalEnvironment rooted at workDir.
@@ -205,15 +241,21 @@ func (e *LocalEnvironment) ExecCommand(ctx context.Context, command string, time
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	// Use /bin/bash on Unix/macOS per spec for richer shell features (arrays,
+	// process substitution, etc.). Windows environments should override this.
+	shell := "/bin/bash"
+	if runtime.GOOS == "windows" {
+		shell = "cmd"
+	}
+	cmd := exec.CommandContext(ctx, shell, "-c", command)
 	cmd.Dir = workingDir
 
 	// Set up process group for clean termination.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Build environment: inherit current env, then overlay provided vars.
-	// Filter out potentially dangerous variables.
-	cmdEnv := filterEnv(os.Environ())
+	// Build environment according to the configured policy, then overlay
+	// any explicitly provided vars.
+	cmdEnv := e.buildEnv()
 	for k, v := range envVars {
 		cmdEnv = append(cmdEnv, k+"="+v)
 	}
@@ -526,6 +568,44 @@ var sensitiveEnvSuffixes = []string{
 	"_TOKEN",
 	"_PASSWORD",
 	"_CREDENTIAL",
+}
+
+// buildEnv returns the environment variable slice for child processes based
+// on the configured EnvVarPolicy.
+func (e *LocalEnvironment) buildEnv() []string {
+	switch e.EnvVarPolicy {
+	case EnvInheritNone:
+		// Only pass PATH so commands can be found.
+		for _, entry := range os.Environ() {
+			key, _, ok := strings.Cut(entry, "=")
+			if ok && key == "PATH" {
+				return []string{entry}
+			}
+		}
+		return nil
+	case EnvInheritCore:
+		return filterEnvCore(os.Environ())
+	default: // EnvInheritAll
+		return filterEnv(os.Environ())
+	}
+}
+
+// filterEnvCore keeps only core development variables and non-sensitive vars.
+func filterEnvCore(environ []string) []string {
+	var filtered []string
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		if isSensitiveEnvVar(key) {
+			continue
+		}
+		if coreEnvVars[key] {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
 }
 
 // filterEnv removes sensitive environment variables from the inherited env.

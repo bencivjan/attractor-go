@@ -45,7 +45,8 @@ func Evaluate(condition string, outcome *state.Outcome, ctx *state.Context) bool
 
 // ParseCondition validates condition syntax without evaluating. It returns
 // an error describing the first syntax problem found, or nil if the
-// condition is well-formed.
+// condition is well-formed. Bare key clauses (no operator) are accepted
+// as valid truthiness checks.
 func ParseCondition(condition string) error {
 	condition = strings.TrimSpace(condition)
 	if condition == "" {
@@ -59,10 +60,31 @@ func ParseCondition(condition string) error {
 			return fmt.Errorf("condition: empty clause at position %d", i)
 		}
 		if _, _, _, err := parseClause(clause); err != nil {
+			// If the clause has no operator, it may be a bare key
+			// truthiness check. Accept it if it looks like a valid
+			// identifier (non-empty after trimming).
+			if isBareKey(clause) {
+				continue
+			}
 			return fmt.Errorf("condition: clause %d: %w", i, err)
 		}
 	}
 	return nil
+}
+
+// isBareKey returns true if the clause is a valid bare identifier that can
+// be used as a truthiness check. It must be non-empty and contain no
+// whitespace or special operator characters.
+func isBareKey(clause string) bool {
+	if clause == "" {
+		return false
+	}
+	for _, ch := range clause {
+		if ch == '=' || ch == '!' || ch == ' ' || ch == '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -180,8 +202,10 @@ func evaluateClause(clause string, outcome *state.Outcome, ctx *state.Context) b
 
 	key, op, literal, err := parseClause(clause)
 	if err != nil {
-		// Malformed clauses evaluate to false to avoid silent misrouting.
-		return false
+		// No operator found -- treat as a bare key truthiness check.
+		// Resolve the key and return true if the value is non-empty.
+		resolved := resolveKey(clause, outcome, ctx)
+		return resolved != ""
 	}
 
 	resolved := resolveKey(key, outcome, ctx)

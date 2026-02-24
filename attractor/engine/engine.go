@@ -869,6 +869,10 @@ func executeWithRetry(
 			"status":  string(outcome.Status),
 		}})
 
+		// Store the current retry count in context so conditions and
+		// downstream handlers can inspect how many retries have occurred.
+		pctx.Set(fmt.Sprintf("internal.retry_count.%s", node.ID), attempt+1)
+
 		// Wait with backoff before retrying.
 		delay := delayForAttempt(attempt, policy)
 		select {
@@ -960,11 +964,16 @@ func writeStatus(stageDir string, outcome *state.Outcome) error {
 
 // mirrorGraphAttributes copies graph-level attributes into the pipeline
 // context so that handlers can reference them. This follows the Scala
-// reference implementation's initializeContext behavior.
+// reference implementation's initializeContext behavior. It also sets the
+// dedicated "graph.goal" key for convenient handler access to the pipeline goal.
 func mirrorGraphAttributes(g *graph.Graph, pctx *state.Context) {
 	for k, v := range g.Attrs {
 		pctx.Set(k, v)
 	}
+	// Explicitly set graph.goal so handlers can reference the pipeline goal
+	// via a dedicated context key, even if the graph attributes use a
+	// different key name internally.
+	pctx.Set("graph.goal", g.Goal())
 }
 
 // writeManifest writes a manifest.json into the run directory with pipeline

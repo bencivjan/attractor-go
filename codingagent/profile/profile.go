@@ -353,6 +353,97 @@ func registerStandardTools(registry *tools.Registry) {
 			},
 		},
 	})
+
+	// Subagent tools (Section 7).
+	registerSubAgentTools(registry)
+}
+
+// registerSubAgentTools adds the spawn_agent, send_input, wait, and
+// close_agent tools shared across all profiles.
+func registerSubAgentTools(registry *tools.Registry) {
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "spawn_agent",
+			Description: "Spawn a subagent to handle a scoped task autonomously. The subagent runs its own agentic loop with independent conversation history.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task": map[string]any{
+						"type":        "string",
+						"description": "Natural language task description for the subagent",
+					},
+					"working_dir": map[string]any{
+						"type":        "string",
+						"description": "Subdirectory to scope the agent to (optional)",
+					},
+					"model": map[string]any{
+						"type":        "string",
+						"description": "Model override (default: parent's model)",
+					},
+					"max_turns": map[string]any{
+						"type":        "integer",
+						"description": "Turn limit for the subagent (0 = unlimited)",
+					},
+				},
+				"required": []string{"task"},
+			},
+		},
+	})
+
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "send_input",
+			Description: "Send a message to a running subagent.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id": map[string]any{
+						"type":        "string",
+						"description": "The ID of the subagent",
+					},
+					"message": map[string]any{
+						"type":        "string",
+						"description": "The message to send",
+					},
+				},
+				"required": []string{"agent_id", "message"},
+			},
+		},
+	})
+
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "wait",
+			Description: "Wait for a subagent to complete and return its result.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id": map[string]any{
+						"type":        "string",
+						"description": "The ID of the subagent to wait for",
+					},
+				},
+				"required": []string{"agent_id"},
+			},
+		},
+	})
+
+	registry.Register(&tools.RegisteredTool{
+		Definition: tools.Definition{
+			Name:        "close_agent",
+			Description: "Terminate a subagent.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id": map[string]any{
+						"type":        "string",
+						"description": "The ID of the subagent to terminate",
+					},
+				},
+				"required": []string{"agent_id"},
+			},
+		},
+	})
 }
 
 // registerApplyPatchTool adds the apply_patch tool (v4a format) used by the

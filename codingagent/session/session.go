@@ -209,6 +209,7 @@ type Session struct {
 	mu            sync.Mutex
 	abortCh       chan struct{}
 	depth         int // subagent nesting depth
+	subagents     *SubAgentManager
 
 	// envContext is the cached <environment> block generated at session start.
 	envContext string
@@ -230,6 +231,7 @@ func New(prof profile.ProviderProfile, execEnv env.ExecutionEnvironment, client 
 		LLMClient:    client,
 		abortCh:      make(chan struct{}),
 	}
+	s.subagents = newSubAgentManager(s)
 
 	// Generate cached context at session start per spec Section 6.3.
 	s.envContext = buildEnvironmentContext(execEnv, prof)
@@ -824,6 +826,60 @@ func (s *Session) executeBuiltinTool(ctx context.Context, name string, args map[
 		}
 		workDir := s.ExecutionEnv.WorkingDirectory()
 		return tools.ApplyPatch(patch, workDir)
+
+	case "spawn_agent":
+		task, _ := args["task"].(string)
+		if task == "" {
+			return "", fmt.Errorf("task is required")
+		}
+		workDir, _ := args["working_dir"].(string)
+		model, _ := args["model"].(string)
+		maxTurns, _ := toInt(args["max_turns"])
+		agentID, err := s.subagents.Spawn(ctx, task, workDir, model, maxTurns)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Spawned subagent %s", agentID), nil
+
+	case "send_input":
+		agentID, _ := args["agent_id"].(string)
+		if agentID == "" {
+			return "", fmt.Errorf("agent_id is required")
+		}
+		message, _ := args["message"].(string)
+		if message == "" {
+			return "", fmt.Errorf("message is required")
+		}
+		if err := s.subagents.SendInput(agentID, message); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Message sent to %s", agentID), nil
+
+	case "wait":
+		agentID, _ := args["agent_id"].(string)
+		if agentID == "" {
+			return "", fmt.Errorf("agent_id is required")
+		}
+		result, err := s.subagents.Wait(agentID)
+		if err != nil {
+			return "", err
+		}
+		status := "succeeded"
+		if !result.Success {
+			status = "failed"
+		}
+		return fmt.Sprintf("Subagent %s %s (%d turns used):\n\n%s", agentID, status, result.TurnsUsed, result.Output), nil
+
+	case "close_agent":
+		agentID, _ := args["agent_id"].(string)
+		if agentID == "" {
+			return "", fmt.Errorf("agent_id is required")
+		}
+		finalStatus, err := s.subagents.Close(agentID)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Subagent %s closed (status: %s)", agentID, finalStatus), nil
 
 	default:
 		return "", fmt.Errorf("no built-in handler for tool %q", name)

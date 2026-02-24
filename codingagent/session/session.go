@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -384,6 +385,9 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 			return fmt.Errorf("maximum tool rounds per input (%d) reached", s.Config.MaxToolRoundsPerInput)
 		}
 
+		// Check context window usage.
+		s.checkContextUsage()
+
 		// ---- Step 2: Build LLM request ----
 		req := s.buildRequest()
 
@@ -688,6 +692,9 @@ func (s *Session) executeSingleTool(ctx context.Context, tc types.ToolCall) type
 
 	if registered == nil {
 		output = fmt.Sprintf("Unknown tool: %q. Available tools: %s", tc.Name, strings.Join(registry.Names(), ", "))
+		isError = true
+	} else if err := validateToolArgs(registered.Definition, tc.Arguments); err != nil {
+		output = fmt.Sprintf("Invalid arguments for tool %q: %s", tc.Name, err.Error())
 		isError = true
 	} else if registered.Executor == nil {
 		// Tool is registered but has no executor bound. Fall back to
@@ -1029,8 +1036,14 @@ func hashToolCalls(calls []types.ToolCall) string {
 	h := sha256.New()
 	for _, tc := range calls {
 		fmt.Fprintf(h, "%s:", tc.Name)
-		for k, v := range tc.Arguments {
-			fmt.Fprintf(h, "%s=%v;", k, v)
+		// Sort keys for deterministic hashing (Go map iteration is random).
+		keys := make([]string, 0, len(tc.Arguments))
+		for k := range tc.Arguments {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(h, "%s=%v;", k, tc.Arguments[k])
 		}
 		h.Write([]byte("|"))
 	}
@@ -1044,6 +1057,46 @@ func hashToolCalls(calls []types.ToolCall) string {
 // countTurns returns the total number of turns in the conversation history.
 func (s *Session) countTurns() int {
 	return len(s.History)
+}
+
+// checkContextUsage estimates token usage using the ~4 chars/token heuristic
+// and emits a warning when usage exceeds 80% of the context window (spec 5.5).
+func (s *Session) checkContextUsage() {
+	windowSize := s.Profile.ContextWindowSize()
+	if windowSize <= 0 {
+		return
+	}
+
+	totalChars := 0
+	for _, turn := range s.History {
+		switch t := turn.(type) {
+		case *UserTurn:
+			totalChars += len(t.Content)
+		case *AssistantTurn:
+			totalChars += len(t.Content) + len(t.Reasoning)
+		case *ToolResultsTurn:
+			for _, r := range t.Results {
+				if s, ok := r.Content.(string); ok {
+					totalChars += len(s)
+				}
+			}
+		case *SystemTurn:
+			totalChars += len(t.Content)
+		case *SteeringTurn:
+			totalChars += len(t.Content)
+		}
+	}
+
+	approxTokens := totalChars / 4
+	threshold := int(float64(windowSize) * 0.8)
+	if approxTokens > threshold {
+		pct := int(float64(approxTokens) / float64(windowSize) * 100)
+		s.EventEmitter.Emit(events.EventWarning, s.ID, map[string]any{
+			"message": fmt.Sprintf("Context usage at ~%d%% of context window", pct),
+			"approx_tokens": approxTokens,
+			"window_size":   windowSize,
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1130,43 @@ func extractToolCalls(resp *types.Response) []types.ToolCall {
 		}
 	}
 	return calls
+}
+
+// validateToolArgs checks that required parameters are present in the
+// tool arguments. Returns nil if validation passes (spec Section 3.8).
+func validateToolArgs(def tools.Definition, args map[string]any) error {
+	if len(def.Parameters) == 0 {
+		return nil
+	}
+	reqSlice, ok := def.Parameters["required"]
+	if !ok {
+		return nil
+	}
+	// The "required" field may be []string or []any depending on how
+	// the tool was registered.
+	var required []string
+	switch r := reqSlice.(type) {
+	case []string:
+		required = r
+	case []any:
+		for _, v := range r {
+			if s, ok := v.(string); ok {
+				required = append(required, s)
+			}
+		}
+	default:
+		return nil
+	}
+	var missing []string
+	for _, name := range required {
+		if _, exists := args[name]; !exists {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required parameter(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // readRawFile reads the entire file content as a string without line numbers.

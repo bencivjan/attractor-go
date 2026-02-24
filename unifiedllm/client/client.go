@@ -124,7 +124,11 @@ func FromEnv() (*Client, error) {
 		}
 	}
 
-	if os.Getenv("GEMINI_API_KEY") != "" {
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	if geminiKey == "" {
+		geminiKey = os.Getenv("GOOGLE_API_KEY")
+	}
+	if geminiKey != "" {
 		adapter, err := gemini.FromEnv()
 		if err != nil {
 			return nil, fmt.Errorf("initializing Gemini adapter: %w", err)

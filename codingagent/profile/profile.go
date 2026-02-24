@@ -115,10 +115,18 @@ func NewAnthropicProfile(model string) *BaseProfile {
 		supportsStreaming:          true,
 		supportsParallelToolCalls: true,
 		contextWindowSize:         200000,
-		providerOptions:           map[string]any{},
-		systemPromptTemplate:      anthropicSystemPrompt,
-		instructionFileNames:      []string{"AGENTS.md", "CLAUDE.md"},
-		knowledgeCutoff:           "2025-04",
+		providerOptions: map[string]any{
+			"anthropic": map[string]any{
+				"beta_headers": []string{
+					"interleaved-thinking-2025-05-14",
+					"prompt-caching-2024-07-31",
+					"token-efficient-tools-2025-02-19",
+				},
+			},
+		},
+		systemPromptTemplate: anthropicSystemPrompt,
+		instructionFileNames: []string{"AGENTS.md", "CLAUDE.md"},
+		knowledgeCutoff:      "2025-04",
 	}
 }
 

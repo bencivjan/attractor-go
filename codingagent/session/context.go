@@ -27,12 +27,31 @@ func buildEnvironmentContext(execEnv env.ExecutionEnvironment, prof profile.Prov
 	isGitRepo := false
 	gitBranch := ""
 
+	gitStatus := ""
+	gitRecentCommits := ""
+
 	result, err := execEnv.ExecCommand(context.Background(), "git rev-parse --is-inside-work-tree", 5000, workDir, nil)
 	if err == nil && result.ExitCode == 0 && strings.TrimSpace(result.Stdout) == "true" {
 		isGitRepo = true
 		branchResult, _ := execEnv.ExecCommand(context.Background(), "git branch --show-current", 5000, workDir, nil)
 		if branchResult != nil && branchResult.ExitCode == 0 {
 			gitBranch = strings.TrimSpace(branchResult.Stdout)
+		}
+		// Short status: count modified and untracked files.
+		statusResult, _ := execEnv.ExecCommand(context.Background(), "git status --short", 5000, workDir, nil)
+		if statusResult != nil && statusResult.ExitCode == 0 {
+			statusOut := strings.TrimSpace(statusResult.Stdout)
+			if statusOut != "" {
+				lines := strings.Split(statusOut, "\n")
+				gitStatus = fmt.Sprintf("%d file(s) with changes", len(lines))
+			} else {
+				gitStatus = "clean"
+			}
+		}
+		// Recent commits.
+		logResult, _ := execEnv.ExecCommand(context.Background(), "git log --oneline -5 2>/dev/null", 5000, workDir, nil)
+		if logResult != nil && logResult.ExitCode == 0 {
+			gitRecentCommits = strings.TrimSpace(logResult.Stdout)
 		}
 	}
 
@@ -42,6 +61,12 @@ func buildEnvironmentContext(execEnv env.ExecutionEnvironment, prof profile.Prov
 	fmt.Fprintf(&b, "Is git repository: %v\n", isGitRepo)
 	if isGitRepo && gitBranch != "" {
 		fmt.Fprintf(&b, "Git branch: %s\n", gitBranch)
+	}
+	if gitStatus != "" {
+		fmt.Fprintf(&b, "Git status: %s\n", gitStatus)
+	}
+	if gitRecentCommits != "" {
+		fmt.Fprintf(&b, "Recent commits:\n%s\n", gitRecentCommits)
 	}
 	fmt.Fprintf(&b, "Platform: %s\n", platform)
 	if osVersion != "" {

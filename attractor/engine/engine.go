@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/strongdm/attractor-go/attractor/condition"
+	"github.com/strongdm/attractor-go/attractor/fidelity"
 	"github.com/strongdm/attractor-go/attractor/graph"
 	"github.com/strongdm/attractor-go/attractor/handler"
 	"github.com/strongdm/attractor-go/attractor/state"
@@ -219,6 +220,24 @@ func ResumeFromCheckpoint(ctx context.Context, g *graph.Graph, checkpoint *state
 		pctx.AppendLog(logEntry)
 	}
 
+	// Degrade fidelity on resume: if the previous node used "full" fidelity,
+	// in-memory LLM sessions cannot be serialized, so we degrade to
+	// "summary:high" for the first resumed node (spec Section 5.3 step 6).
+	prevFidelityStr := ""
+	if v, ok := checkpoint.ContextValues["internal.fidelity"]; ok {
+		if s, ok := v.(string); ok {
+			prevFidelityStr = s
+		}
+	}
+	if prevMode, ok := fidelity.ParseMode(prevFidelityStr); ok {
+		degraded := fidelity.DegradeForCheckpointResume(prevMode)
+		if degraded != prevMode {
+			pctx.Set("internal.fidelity", string(degraded))
+			pctx.Set("internal.fidelity_degraded", true)
+			pctx.AppendLog(fmt.Sprintf("Checkpoint resume: degraded fidelity from '%s' to '%s' (LLM sessions not serializable)", prevMode, degraded))
+		}
+	}
+
 	runID := fmt.Sprintf("run-%s-resumed", time.Now().UTC().Format("20060102-150405"))
 	runDir := filepath.Join(cfg.LogsRoot, runID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -254,6 +273,10 @@ func executeLoop(
 	maxSteps := cfg.maxSteps()
 	stageStep := 0 // per-loop step counter for stage directory naming
 
+	// Track the edge and previous node for fidelity resolution.
+	var incomingEdge *graph.Edge
+	var previousNodeID string
+
 	for step := 0; step < maxSteps; step++ {
 		// Check for context cancellation.
 		select {
@@ -288,15 +311,49 @@ func executeLoop(
 			if !ok {
 				return nil, fmt.Errorf("engine: retry target '%s' not found in graph", retryTarget)
 			}
+			previousNodeID = currentNode.ID
+			incomingEdge = nil // retry jumps have no edge context
 			currentNode = targetNode
 			continue
 		}
 
+		// Resolve and apply context fidelity (Section 5.4).
+		// This determines how much context is carried into the handler.
+		mode := fidelity.ResolveFidelity(incomingEdge, currentNode, g)
+		pctx.Set("internal.fidelity", string(mode))
+		pctx.Set("current_node", currentNode.ID)
+
+		if mode == fidelity.Full {
+			threadID := fidelity.ResolveThreadID(incomingEdge, currentNode, g, previousNodeID)
+			pctx.Set("internal.thread_id", threadID)
+		}
+
+		// Apply fidelity filtering to the context snapshot that handlers see.
+		// The filtered snapshot is written back into the context so that
+		// handlers receive only the appropriate level of prior state.
+		filteredSnap, filteredLogs := fidelity.ApplyFidelity(mode, pctx.Snapshot(), pctx.Logs())
+		if mode != fidelity.Full {
+			// For non-full modes, replace the context with the filtered view.
+			// Preserve the internal keys that were just set above.
+			internalFidelity := pctx.GetString("internal.fidelity", "")
+			internalThreadID := pctx.GetString("internal.thread_id", "")
+			pctx.Clear()
+			pctx.ApplyUpdates(filteredSnap)
+			for _, logEntry := range filteredLogs {
+				pctx.AppendLog(logEntry)
+			}
+			pctx.Set("internal.fidelity", internalFidelity)
+			if internalThreadID != "" {
+				pctx.Set("internal.thread_id", internalThreadID)
+			}
+		}
+
 		// Step 2b: Execute node handler with retry policy.
 		emit(cfg, Event{Kind: EventStageStarted, Timestamp: time.Now(), Data: map[string]any{
-			"node":  currentNode.ID,
-			"label": currentNode.Label(),
-			"step":  step,
+			"node":     currentNode.ID,
+			"label":    currentNode.Label(),
+			"step":     step,
+			"fidelity": string(mode),
 		}})
 
 		policy := buildRetryPolicy(currentNode, g)
@@ -398,11 +455,14 @@ func executeLoop(
 			stageStep = 0
 		}
 
-		// Step 2g: Advance to next node.
+		// Step 2g: Advance to next node, tracking edge and previous node for
+		// fidelity resolution on the next iteration.
 		nextNode, ok := g.Nodes[edge.To]
 		if !ok {
 			return nil, fmt.Errorf("engine: next node '%s' not found in graph", edge.To)
 		}
+		previousNodeID = currentNode.ID
+		incomingEdge = edge
 		currentNode = nextNode
 	}
 

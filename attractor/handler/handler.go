@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/strongdm/attractor-go/attractor/condition"
 	"github.com/strongdm/attractor-go/attractor/graph"
 	"github.com/strongdm/attractor-go/attractor/interviewer"
 	"github.com/strongdm/attractor-go/attractor/state"
@@ -125,6 +126,21 @@ func (r *Registry) Resolve(node *graph.Node) Handler {
 // The error return is for unexpected system errors (not LLM failures).
 type CodergenBackend interface {
 	Run(node *graph.Node, prompt string, ctx *state.Context) (any, error)
+}
+
+// ---------------------------------------------------------------------------
+// PipelineExecutor interface
+// ---------------------------------------------------------------------------
+
+// PipelineExecutor is the interface used by handlers that need to run child
+// pipelines (such as StackManagerLoopHandler). It is defined here to avoid
+// circular imports between the handler and engine packages -- the engine
+// package implements this interface on its Runner type.
+type PipelineExecutor interface {
+	// ExecuteDOT parses and executes a DOT pipeline, returning the final
+	// outcome. The initialContext seeds the child pipeline's context before
+	// execution begins.
+	ExecuteDOT(ctx context.Context, dotSource string, logsRoot string, initialContext map[string]any) (*state.Outcome, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,11 +649,21 @@ func (h *FanInHandler) Execute(_ context.Context, node *graph.Node, pctx *state.
 //   - tool_command: the shell command to execute (required)
 //   - tool_timeout: timeout in seconds (optional, default 60)
 //   - tool_cwd: working directory (optional)
-type ToolHandler struct{}
+//
+// Graph-level attributes tool_hooks.pre and tool_hooks.post configure shell
+// commands that run before and after each tool invocation respectively.
+type ToolHandler struct {
+	// PreHook is a shell command run before each tool execution.
+	// It receives NODE_ID and TOOL_NAME environment variables.
+	PreHook string
+	// PostHook is a shell command run after each tool execution.
+	// It receives NODE_ID, TOOL_NAME, and TOOL_RESULT environment variables.
+	PostHook string
+}
 
 // Execute runs the tool command and returns success or failure based on
 // the exit code.
-func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Context, _ *graph.Graph, logsRoot string) (*state.Outcome, error) {
+func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Context, g *graph.Graph, logsRoot string) (*state.Outcome, error) {
 	command := node.Attrs["tool_command"]
 	if command == "" {
 		return &state.Outcome{
@@ -652,6 +678,25 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 	stageDir := filepath.Join(logsRoot, node.ID)
 	if err := os.MkdirAll(stageDir, 0o755); err != nil {
 		return nil, fmt.Errorf("tool: create stage dir: %w", err)
+	}
+
+	// Resolve tool hooks: struct fields take precedence, then graph-level attributes.
+	preHook := h.PreHook
+	if preHook == "" && g != nil {
+		preHook = g.Attrs["tool_hooks.pre"]
+	}
+	postHook := h.PostHook
+	if postHook == "" && g != nil {
+		postHook = g.Attrs["tool_hooks.post"]
+	}
+
+	// Run pre-hook if configured.
+	toolName := node.Attrs["tool_name"]
+	if toolName == "" {
+		toolName = node.ID
+	}
+	if preHook != "" {
+		runToolHook(preHook, node.ID, toolName, "")
 	}
 
 	// Build the command with a timeout derived from the parent context.
@@ -691,6 +736,12 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 		if len(truncStderr) > 200 {
 			truncStderr = truncStderr[:200]
 		}
+
+		// Run post-hook on failure (best-effort).
+		if postHook != "" {
+			runToolHook(postHook, node.ID, toolName, truncStderr)
+		}
+
 		return &state.Outcome{
 			Status:        state.StatusFail,
 			FailureReason: fmt.Sprintf("Tool '%s' failed (exit %d): %s", node.ID, exitCode, truncStderr),
@@ -706,6 +757,12 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 	if len(truncStdout) > 200 {
 		truncStdout = truncStdout[:200] + "..."
 	}
+
+	// Run post-hook on success (best-effort).
+	if postHook != "" {
+		runToolHook(postHook, node.ID, toolName, truncStdout)
+	}
+
 	return &state.Outcome{
 		Status: state.StatusSuccess,
 		Notes:  fmt.Sprintf("Tool '%s' completed (exit 0)", node.ID),
@@ -721,15 +778,251 @@ func (h *ToolHandler) Execute(ctx context.Context, node *graph.Node, _ *state.Co
 // StackManagerLoopHandler
 // ---------------------------------------------------------------------------
 
-// StackManagerLoopHandler manages recursive stack-based execution loops.
-// It tracks loop iterations via context and delegates to outgoing edges
-// for the actual loop body. This is a pass-through that increments the
-// loop counter; the engine handles the actual iteration via loop_restart
-// edges.
-type StackManagerLoopHandler struct{}
+// StackManagerLoopHandler implements the full supervisor pattern from the
+// Attractor spec (Section 4.11). It orchestrates sprint-based iteration by
+// running a child pipeline in a loop, observing child telemetry, optionally
+// steering the child, and evaluating stop conditions between cycles.
+//
+// Node attributes:
+//   - stack.child_dotfile: DOT source for the child pipeline (falls back to node label as description)
+//   - manager.poll_interval: duration between observe/steer cycles (default "1s")
+//   - manager.max_cycles: maximum number of supervisor cycles (default 10)
+//   - manager.stop_condition: condition expression evaluated each cycle; if true, returns success
+//   - manager.actions: comma-separated list of actions per cycle (default "observe,wait")
+//     Supported actions: "observe", "steer", "wait"
+//   - stack.child_autostart: whether to auto-start the child (default "true")
+//
+// Context keys set by the handler:
+//   - stack.child.iteration: current cycle number (1-based)
+//   - stack.child.last_status: status of the most recent child pipeline run
+//   - stack.child.total_iterations: total cycles completed
+//   - stack.child.outcome: "success" or "fail" based on the last child run
+//   - context.stack.child.status: "completed" or "failed" based on the last child run
+type StackManagerLoopHandler struct {
+	// Executor runs child pipelines. When nil, the handler falls back to
+	// the simple counter-increment behavior for backward compatibility.
+	Executor PipelineExecutor
+}
 
-// Execute increments the loop counter and returns success.
-func (h *StackManagerLoopHandler) Execute(_ context.Context, node *graph.Node, pctx *state.Context, _ *graph.Graph, _ string) (*state.Outcome, error) {
+// Execute implements the supervisor observe/steer/wait loop described in
+// the spec. If no Executor is configured, it falls back to incrementing
+// a loop counter for backward compatibility with tests and simple setups.
+func (h *StackManagerLoopHandler) Execute(ctx context.Context, node *graph.Node, pctx *state.Context, g *graph.Graph, logsRoot string) (*state.Outcome, error) {
+	// Parse configuration from node attributes.
+	childDOT := node.Attrs["stack.child_dotfile"]
+	if childDOT == "" {
+		// Fall back to graph-level attribute, then node label as description.
+		childDOT = g.Attrs["stack.child_dotfile"]
+	}
+
+	pollInterval := parseDurationDefault(node.Attrs["manager.poll_interval"], 1*time.Second)
+	maxCycles := attrIntDefault(node.Attrs, "manager.max_cycles", 10)
+	stopCondition := node.Attrs["manager.stop_condition"]
+	actionsRaw := node.Attrs["manager.actions"]
+	if actionsRaw == "" {
+		actionsRaw = "observe,wait"
+	}
+	actions := parseActions(actionsRaw)
+	autoStart := node.Attrs["stack.child_autostart"] != "false" // default true
+
+	// If no executor is available or no child DOT is configured, fall back
+	// to the simple counter-increment behavior. This preserves backward
+	// compatibility for callers that do not inject a PipelineExecutor.
+	if h.Executor == nil || childDOT == "" {
+		return h.fallbackExecute(node, pctx)
+	}
+
+	// Create a stage directory for this manager node's logs.
+	stageDir := filepath.Join(logsRoot, node.ID)
+	_ = os.MkdirAll(stageDir, 0o755)
+
+	// --- Supervisor loop ---
+	var lastChildOutcome *state.Outcome
+	totalIterations := 0
+
+	for cycle := 1; cycle <= maxCycles; cycle++ {
+		// Check for context cancellation.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		totalIterations = cycle
+
+		// Update iteration tracking in context.
+		pctx.Set("stack.child.iteration", cycle)
+		pctx.Set("stack.child.total_iterations", totalIterations)
+
+		// --- Observe ---
+		if actions["observe"] {
+			// Ingest child telemetry: read child status keys from context.
+			// The child pipeline writes its own status, so observing is
+			// simply acknowledging what context already holds.
+			childStatus := pctx.GetString("context.stack.child.status", "")
+			childOutcomeStr := pctx.GetString("context.stack.child.outcome", "")
+
+			if childStatus == "completed" || childStatus == "failed" {
+				if childOutcomeStr == "success" {
+					return &state.Outcome{
+						Status: state.StatusSuccess,
+						Notes:  fmt.Sprintf("Manager '%s': child completed successfully at cycle %d", node.ID, cycle),
+						ContextUpdates: map[string]any{
+							"stack.child.iteration":        cycle,
+							"stack.child.total_iterations": totalIterations,
+							"stack.child.last_status":      "success",
+							"last_stage":                   node.ID,
+						},
+					}, nil
+				}
+				if childStatus == "failed" {
+					return &state.Outcome{
+						Status:        state.StatusFail,
+						FailureReason: fmt.Sprintf("Manager '%s': child failed at cycle %d", node.ID, cycle),
+						ContextUpdates: map[string]any{
+							"stack.child.iteration":        cycle,
+							"stack.child.total_iterations": totalIterations,
+							"stack.child.last_status":      "fail",
+							"last_stage":                   node.ID,
+						},
+					}, nil
+				}
+			}
+		}
+
+		// --- Steer ---
+		if actions["steer"] {
+			// Write steering context that the child can read on its next
+			// iteration. The steer action sets a key indicating intervention
+			// is requested; specific steer instructions come from node attrs.
+			steerInstruction := node.Attrs["manager.steer_instruction"]
+			if steerInstruction != "" {
+				pctx.Set("stack.child.steer_instruction", steerInstruction)
+			}
+			pctx.Set("stack.child.steer_cycle", cycle)
+		}
+
+		// --- Execute child pipeline ---
+		if autoStart || cycle > 1 {
+			childLogsDir := filepath.Join(stageDir, fmt.Sprintf("child-%03d", cycle))
+
+			// Build the initial context for the child from the parent's
+			// current snapshot, scoped to keys the child should see.
+			childInitCtx := buildChildContext(pctx, cycle)
+
+			childOutcome, err := h.Executor.ExecuteDOT(ctx, childDOT, childLogsDir, childInitCtx)
+			if err != nil {
+				// ExecuteDOT error is a system failure, not a child pipeline
+				// status=fail. Record it and continue to next cycle or bail.
+				pctx.Set("context.stack.child.status", "failed")
+				pctx.Set("context.stack.child.outcome", "fail")
+				pctx.Set("stack.child.last_status", "fail")
+				lastChildOutcome = &state.Outcome{
+					Status:        state.StatusFail,
+					FailureReason: fmt.Sprintf("child pipeline error: %v", err),
+				}
+			} else {
+				lastChildOutcome = childOutcome
+
+				// Update context with child results.
+				childStatusStr := strings.ToLower(string(childOutcome.Status))
+				pctx.Set("stack.child.last_status", childStatusStr)
+				pctx.Set("stack.child.outcome", childStatusStr)
+
+				if childOutcome.Status == state.StatusSuccess {
+					pctx.Set("context.stack.child.status", "completed")
+					pctx.Set("context.stack.child.outcome", "success")
+				} else if childOutcome.Status == state.StatusFail {
+					pctx.Set("context.stack.child.status", "failed")
+					pctx.Set("context.stack.child.outcome", "fail")
+				} else {
+					pctx.Set("context.stack.child.status", "running")
+					pctx.Set("context.stack.child.outcome", childStatusStr)
+				}
+			}
+		}
+
+		// --- Evaluate stop condition ---
+		if stopCondition != "" {
+			// Use the condition evaluator to check the stop expression
+			// against the current context. We pass a nil outcome since the
+			// stop condition operates on context keys, not a handler outcome.
+			if condition.Evaluate(stopCondition, nil, pctx) {
+				return &state.Outcome{
+					Status: state.StatusSuccess,
+					Notes:  fmt.Sprintf("Manager '%s': stop condition satisfied at cycle %d", node.ID, cycle),
+					ContextUpdates: map[string]any{
+						"stack.child.iteration":        cycle,
+						"stack.child.total_iterations": totalIterations,
+						"stack.child.last_status":      pctx.GetString("stack.child.last_status", ""),
+						"last_stage":                   node.ID,
+					},
+				}, nil
+			}
+		}
+
+		// Check if the child completed or failed (post-execution observe).
+		childStatus := pctx.GetString("context.stack.child.status", "")
+		if childStatus == "completed" {
+			childOutcomeStr := pctx.GetString("context.stack.child.outcome", "")
+			if childOutcomeStr == "success" {
+				return &state.Outcome{
+					Status: state.StatusSuccess,
+					Notes:  fmt.Sprintf("Manager '%s': child completed successfully at cycle %d", node.ID, cycle),
+					ContextUpdates: map[string]any{
+						"stack.child.iteration":        cycle,
+						"stack.child.total_iterations": totalIterations,
+						"stack.child.last_status":      "success",
+						"last_stage":                   node.ID,
+					},
+				}, nil
+			}
+		}
+		if childStatus == "failed" {
+			return &state.Outcome{
+				Status:        state.StatusFail,
+				FailureReason: fmt.Sprintf("Manager '%s': child failed at cycle %d", node.ID, cycle),
+				ContextUpdates: map[string]any{
+					"stack.child.iteration":        cycle,
+					"stack.child.total_iterations": totalIterations,
+					"stack.child.last_status":      "fail",
+					"last_stage":                   node.ID,
+				},
+			}, nil
+		}
+
+		// --- Wait ---
+		if actions["wait"] {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(pollInterval):
+			}
+		}
+	}
+
+	// Max cycles exceeded.
+	failReason := fmt.Sprintf("Manager '%s': max cycles (%d) exceeded", node.ID, maxCycles)
+	lastStatus := "fail"
+	if lastChildOutcome != nil {
+		lastStatus = strings.ToLower(string(lastChildOutcome.Status))
+	}
+
+	return &state.Outcome{
+		Status:        state.StatusFail,
+		FailureReason: failReason,
+		ContextUpdates: map[string]any{
+			"stack.child.iteration":        totalIterations,
+			"stack.child.total_iterations": totalIterations,
+			"stack.child.last_status":      lastStatus,
+			"last_stage":                   node.ID,
+		},
+	}, nil
+}
+
+// fallbackExecute provides the simple counter-increment behavior used when
+// no PipelineExecutor is available. This preserves backward compatibility.
+func (h *StackManagerLoopHandler) fallbackExecute(node *graph.Node, pctx *state.Context) (*state.Outcome, error) {
 	counterKey := fmt.Sprintf("loop.%s.iteration", node.ID)
 	current := pctx.GetInt(counterKey, 0)
 	next := current + 1
@@ -742,6 +1035,52 @@ func (h *StackManagerLoopHandler) Execute(_ context.Context, node *graph.Node, p
 			"last_stage": node.ID,
 		},
 	}, nil
+}
+
+// parseActions splits a comma-separated action list into a lookup set.
+func parseActions(raw string) map[string]bool {
+	actions := make(map[string]bool)
+	for _, a := range strings.Split(raw, ",") {
+		a = strings.TrimSpace(strings.ToLower(a))
+		if a != "" {
+			actions[a] = true
+		}
+	}
+	return actions
+}
+
+// parseDurationDefault parses a duration string with a fallback default.
+func parseDurationDefault(raw string, def time.Duration) time.Duration {
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// buildChildContext creates an initial context map for the child pipeline
+// from the parent's current state. It passes through goal, steering
+// instructions, and iteration metadata.
+func buildChildContext(pctx *state.Context, cycle int) map[string]any {
+	childCtx := make(map[string]any)
+
+	// Pass through the goal if set.
+	if goal := pctx.GetString("goal", ""); goal != "" {
+		childCtx["goal"] = goal
+	}
+
+	// Pass through steering instructions.
+	if steer := pctx.GetString("stack.child.steer_instruction", ""); steer != "" {
+		childCtx["manager.steer_instruction"] = steer
+	}
+
+	// Pass iteration metadata.
+	childCtx["manager.parent_cycle"] = cycle
+
+	return childCtx
 }
 
 // ---------------------------------------------------------------------------
@@ -790,8 +1129,10 @@ func (NoopHandler) Execute(_ context.Context, node *graph.Node, _ *state.Context
 // DefaultRegistryFull creates a Registry with all built-in handlers registered.
 // The backend parameter provides the LLM backend for CodergenHandler (nil
 // for simulation mode). The interv parameter provides the interviewer for
-// WaitForHumanHandler (nil falls back to AutoApproveInterviewer).
-func DefaultRegistryFull(backend CodergenBackend, interv interviewer.Interviewer) *Registry {
+// WaitForHumanHandler (nil falls back to AutoApproveInterviewer). The
+// executor parameter provides child pipeline execution for the manager loop
+// handler (nil falls back to simple counter-increment behavior).
+func DefaultRegistryFull(backend CodergenBackend, interv interviewer.Interviewer, executor PipelineExecutor) *Registry {
 	if interv == nil {
 		interv = &interviewer.AutoApproveInterviewer{}
 	}
@@ -806,7 +1147,7 @@ func DefaultRegistryFull(backend CodergenBackend, interv interviewer.Interviewer
 	r.Register("parallel", NewParallelHandler(r))
 	r.Register("parallel.fan_in", &FanInHandler{})
 	r.Register("tool", &ToolHandler{})
-	r.Register("stack.manager_loop", &StackManagerLoopHandler{})
+	r.Register("stack.manager_loop", &StackManagerLoopHandler{Executor: executor})
 	r.Register("communication", &CommunicationHandler{})
 
 	return r
@@ -820,6 +1161,28 @@ func DefaultRegistry(defaultHandler Handler) *Registry {
 	r.Register("start", &StartHandler{})
 	r.Register("exit", &ExitHandler{})
 	return r
+}
+
+// ---------------------------------------------------------------------------
+// Tool hook helper
+// ---------------------------------------------------------------------------
+
+// runToolHook executes a shell command as a tool hook, passing NODE_ID,
+// TOOL_NAME, and optionally TOOL_RESULT as environment variables. Errors
+// are silently ignored because hooks are best-effort.
+func runToolHook(hookCmd, nodeID, toolName, result string) {
+	if hookCmd == "" {
+		return
+	}
+	cmd := exec.Command("sh", "-c", hookCmd)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("NODE_ID=%s", nodeID),
+		fmt.Sprintf("TOOL_NAME=%s", toolName),
+	)
+	if result != "" {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("TOOL_RESULT=%s", result))
+	}
+	_ = cmd.Run()
 }
 
 // ---------------------------------------------------------------------------

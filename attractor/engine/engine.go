@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -52,6 +53,32 @@ type Config struct {
 	// execution begins. This allows callers (such as FactoryRunner) to
 	// seed the context with values from a prior pipeline run.
 	InitialContext map[string]any
+
+	// OnFinalize is an optional callback invoked at the end of Run() after
+	// the execution loop completes and the final checkpoint is saved. Use
+	// this for cleanup, metrics flush, or resource teardown.
+	OnFinalize func()
+
+	// ToolHooks configures optional shell commands executed before and after
+	// each tool invocation in the pipeline.
+	ToolHooks *ToolHookConfig
+}
+
+// ToolHookConfig defines shell commands run before and after each tool call.
+type ToolHookConfig struct {
+	// PreHook is a shell command run before each tool call. The command
+	// receives NODE_ID and TOOL_NAME environment variables.
+	PreHook string
+	// PostHook is a shell command run after each tool call. The command
+	// receives NODE_ID, TOOL_NAME, and TOOL_RESULT environment variables.
+	PostHook string
+}
+
+// Finalizer is an optional interface that handlers may implement to release
+// resources at the end of a pipeline run. If a handler satisfies this
+// interface, its Finalize method is called during the finalization phase.
+type Finalizer interface {
+	Finalize() error
 }
 
 func (c Config) maxSteps() int {
@@ -81,6 +108,7 @@ const (
 	EventInterviewCompleted EventKind = "interview_completed"
 	EventParallelStarted    EventKind = "parallel_started"
 	EventParallelCompleted  EventKind = "parallel_completed"
+	EventPipelineFinalized  EventKind = "pipeline_finalized"
 )
 
 // Event is a structured lifecycle event emitted during pipeline execution.
@@ -113,6 +141,91 @@ func defaultRetryPolicy() RetryPolicy {
 		MaxDelay:      60 * time.Second,
 		Jitter:        true,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Backoff presets
+// ---------------------------------------------------------------------------
+
+// BackoffPreset identifies a named, pre-configured retry strategy. These map
+// to the preset policies table in the Attractor spec (Section 3.6).
+type BackoffPreset string
+
+const (
+	// BackoffNone disables retries entirely (MaxAttempts=1).
+	BackoffNone BackoffPreset = "none"
+	// BackoffStandard is a general-purpose exponential backoff.
+	BackoffStandard BackoffPreset = "standard"
+	// BackoffAggressive retries quickly with a steep backoff factor.
+	BackoffAggressive BackoffPreset = "aggressive"
+	// BackoffLinear uses a constant delay between attempts.
+	BackoffLinear BackoffPreset = "linear"
+	// BackoffPatient waits longer between attempts for slow operations.
+	BackoffPatient BackoffPreset = "patient"
+)
+
+// PresetRetryPolicy returns a RetryPolicy configured according to the named
+// preset. The maxAttempts parameter overrides the preset's default max
+// attempts if it is > 0; otherwise the preset default is used.
+//
+// Preset parameters (per spec Section 3.6):
+//
+//	none:       MaxAttempts=1
+//	standard:   InitialDelay=200ms, Factor=2.0, MaxDelay=30s,  Jitter=true,  MaxAttempts=5
+//	aggressive: InitialDelay=500ms, Factor=2.0, MaxDelay=10s,  Jitter=true,  MaxAttempts=5
+//	linear:     InitialDelay=500ms, Factor=1.0, MaxDelay=10s,  Jitter=false, MaxAttempts=3
+//	patient:    InitialDelay=2s,    Factor=3.0, MaxDelay=120s, Jitter=true,  MaxAttempts=3
+func PresetRetryPolicy(preset BackoffPreset, maxAttempts int) RetryPolicy {
+	var policy RetryPolicy
+
+	switch preset {
+	case BackoffNone:
+		policy = RetryPolicy{
+			MaxAttempts: 1,
+		}
+	case BackoffStandard:
+		policy = RetryPolicy{
+			MaxAttempts:   5,
+			InitialDelay:  200 * time.Millisecond,
+			BackoffFactor: 2.0,
+			MaxDelay:      30 * time.Second,
+			Jitter:        true,
+		}
+	case BackoffAggressive:
+		policy = RetryPolicy{
+			MaxAttempts:   5,
+			InitialDelay:  500 * time.Millisecond,
+			BackoffFactor: 2.0,
+			MaxDelay:      10 * time.Second,
+			Jitter:        true,
+		}
+	case BackoffLinear:
+		policy = RetryPolicy{
+			MaxAttempts:   3,
+			InitialDelay:  500 * time.Millisecond,
+			BackoffFactor: 1.0,
+			MaxDelay:      10 * time.Second,
+			Jitter:        false,
+		}
+	case BackoffPatient:
+		policy = RetryPolicy{
+			MaxAttempts:   3,
+			InitialDelay:  2 * time.Second,
+			BackoffFactor: 3.0,
+			MaxDelay:      120 * time.Second,
+			Jitter:        true,
+		}
+	default:
+		// Unknown preset: fall back to the standard default policy.
+		return defaultRetryPolicy()
+	}
+
+	// Allow caller to override max attempts.
+	if maxAttempts > 0 {
+		policy.MaxAttempts = maxAttempts
+	}
+
+	return policy
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +303,17 @@ func Run(ctx context.Context, g *graph.Graph, cfg Config) (*state.Outcome, error
 		emit(cfg, Event{Kind: EventPipelineFailed, Timestamp: time.Now(), Data: map[string]any{
 			"error": err.Error(),
 		}})
+		// Run finalization even on failure to ensure resources are released.
+		finalize(cfg)
 		return nil, err
 	}
 
 	emit(cfg, Event{Kind: EventPipelineCompleted, Timestamp: time.Now(), Data: map[string]any{
 		"status": string(outcome.Status),
 	}})
+
+	// FINALIZE phase: close open resources and invoke the finalization callback.
+	finalize(cfg)
 
 	return outcome, nil
 }
@@ -749,7 +867,15 @@ func delayForAttempt(attempt int, policy RetryPolicy) time.Duration {
 // buildRetryPolicy constructs a retry policy for a node, merging node-level
 // settings with the graph-level defaults.
 func buildRetryPolicy(node *graph.Node, g *graph.Graph) RetryPolicy {
-	policy := defaultRetryPolicy()
+	// If the node specifies a backoff_preset, use the preset as the base
+	// policy instead of the default. The node's max_retries still overrides
+	// the preset's max attempts.
+	var policy RetryPolicy
+	if preset := node.BackoffPreset(); preset != "" {
+		policy = PresetRetryPolicy(BackoffPreset(preset), 0)
+	} else {
+		policy = defaultRetryPolicy()
+	}
 
 	// Node-level max_retries overrides the default max attempts.
 	// max_retries=N means up to N+1 total executions (spec Section 2.6, 3.5).
@@ -807,6 +933,55 @@ func writeManifest(runDir string, g *graph.Graph, startTime time.Time) {
 		return
 	}
 	_ = os.WriteFile(filepath.Join(runDir, "manifest.json"), data, 0o644)
+}
+
+// ---------------------------------------------------------------------------
+// Finalization
+// ---------------------------------------------------------------------------
+
+// finalize executes the finalization phase of a pipeline run. It emits a
+// finalization event and invokes the OnFinalize callback if configured.
+func finalize(cfg Config) {
+	emit(cfg, Event{Kind: EventPipelineFinalized, Timestamp: time.Now()})
+
+	if cfg.OnFinalize != nil {
+		cfg.OnFinalize()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tool call hooks
+// ---------------------------------------------------------------------------
+
+// runPreHook executes the configured pre-tool-call shell command. The command
+// receives NODE_ID and TOOL_NAME as environment variables. Returns an error
+// if the hook command fails.
+func runPreHook(cfg Config, nodeID, toolName string) error {
+	if cfg.ToolHooks == nil || cfg.ToolHooks.PreHook == "" {
+		return nil
+	}
+	cmd := exec.Command("sh", "-c", cfg.ToolHooks.PreHook)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("NODE_ID=%s", nodeID),
+		fmt.Sprintf("TOOL_NAME=%s", toolName),
+	)
+	return cmd.Run()
+}
+
+// runPostHook executes the configured post-tool-call shell command. The command
+// receives NODE_ID, TOOL_NAME, and TOOL_RESULT as environment variables.
+// Errors are silently ignored because post-hooks are best-effort.
+func runPostHook(cfg Config, nodeID, toolName string, result string) {
+	if cfg.ToolHooks == nil || cfg.ToolHooks.PostHook == "" {
+		return
+	}
+	cmd := exec.Command("sh", "-c", cfg.ToolHooks.PostHook)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("NODE_ID=%s", nodeID),
+		fmt.Sprintf("TOOL_NAME=%s", toolName),
+		fmt.Sprintf("TOOL_RESULT=%s", result),
+	)
+	_ = cmd.Run()
 }
 
 // ---------------------------------------------------------------------------

@@ -91,6 +91,10 @@ type Config struct {
 	LoopDetectionWindow int
 	// MaxSubagentDepth limits how deeply sub-agents can be nested.
 	MaxSubagentDepth int
+	// UserInstructions contains user-provided instructions that are appended
+	// to the end of the system prompt. This allows callers to inject custom
+	// guidance that overrides default behavior.
+	UserInstructions string
 }
 
 // DefaultConfig returns a Config with sensible production defaults.
@@ -324,15 +328,37 @@ func (s *Session) FollowUp(message string) {
 }
 
 // Abort signals the session to stop processing at the next safe point.
+// It closes the abort channel (which cancels in-flight contexts), emits a
+// SESSION_END event with the abort reason, cleans up any running subagents,
+// and transitions the session to StateClosed.
 func (s *Session) Abort() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	alreadyAborted := false
 	select {
 	case <-s.abortCh:
-		// Already aborted.
+		alreadyAborted = true
 	default:
 		close(s.abortCh)
 	}
+
+	if alreadyAborted {
+		s.mu.Unlock()
+		return
+	}
+
+	s.State = StateClosed
+	s.mu.Unlock()
+
+	// Clean up all running subagents.
+	if s.subagents != nil {
+		s.subagents.CloseAll()
+	}
+
+	// Emit SESSION_END with abort reason so listeners know the session
+	// was terminated rather than completing naturally.
+	s.EventEmitter.Emit(events.EventSessionEnd, s.ID, map[string]any{
+		"reason": "aborted",
+	})
 }
 
 // Close terminates the session and emits a session_end event. After Close,
@@ -424,6 +450,14 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 			assistantTurn, callErr = s.callLLMBlocking(ctx, req, toolRound)
 		}
 		if callErr != nil {
+			// Unrecoverable errors (authentication, access denied, context
+			// length exceeded) should transition the session to CLOSED
+			// because retrying will not help.
+			if isUnrecoverableError(callErr) {
+				s.mu.Lock()
+				s.State = StateClosed
+				s.mu.Unlock()
+			}
 			return callErr
 		}
 		toolCalls := assistantTurn.ToolCalls
@@ -431,6 +465,14 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 
 		// ---- Step 5: No tool calls -> natural completion ----
 		if len(toolCalls) == 0 {
+			// If the response looks like a question, transition to
+			// StateAwaitingInput so the caller knows to provide more
+			// input before the session can continue.
+			if isQuestionText(assistantTurn.Content) {
+				s.mu.Lock()
+				s.State = StateAwaitingInput
+				s.mu.Unlock()
+			}
 			return nil
 		}
 
@@ -641,6 +683,12 @@ func (s *Session) callLLMStreaming(ctx context.Context, req types.Request, toolR
 func (s *Session) buildRequest() types.Request {
 	// System prompt with cached environment context and project docs.
 	systemPrompt := s.Profile.BuildSystemPrompt(s.envContext, s.projectDocs)
+
+	// Append user-provided instructions to the end of the system prompt
+	// so they take precedence over default behavior.
+	if s.Config.UserInstructions != "" {
+		systemPrompt += "\n\n# User Instructions\n" + s.Config.UserInstructions
+	}
 
 	messages := s.convertHistoryToMessages()
 
@@ -1002,6 +1050,29 @@ func (s *Session) executeBuiltinTool(ctx context.Context, name string, args map[
 		}
 		workDir := s.ExecutionEnv.WorkingDirectory()
 		return tools.ApplyPatch(patch, workDir)
+
+	case "read_many_files":
+		pathsRaw, _ := args["paths"].([]any)
+		if len(pathsRaw) == 0 {
+			return "", fmt.Errorf("paths is required and must be a non-empty array")
+		}
+		var b strings.Builder
+		for i, raw := range pathsRaw {
+			filePath, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			content, err := s.ExecutionEnv.ReadFile(filePath, 0, 0)
+			if err != nil {
+				fmt.Fprintf(&b, "--- %s ---\nError: %s\n", filePath, err.Error())
+			} else {
+				fmt.Fprintf(&b, "--- %s ---\n%s\n", filePath, content)
+			}
+			if i < len(pathsRaw)-1 {
+				b.WriteString("\n")
+			}
+		}
+		return b.String(), nil
 
 	case "spawn_agent":
 		task, _ := args["task"].(string)
@@ -1467,4 +1538,85 @@ func generateSessionID() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%d", time.Now().UnixNano())
 	return fmt.Sprintf("sess_%x", h.Sum(nil)[:8])
+}
+
+// isQuestionText detects whether the model's response looks like a question
+// directed at the user. It uses simple heuristics: the text ends with "?" or
+// contains common question phrases near the end. This is intentionally
+// conservative to avoid false positives on rhetorical or embedded questions.
+func isQuestionText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+
+	// Direct check: text ends with a question mark.
+	if strings.HasSuffix(trimmed, "?") {
+		return true
+	}
+
+	// Check the last ~200 characters for question patterns. This catches
+	// responses that end with a question followed by a small amount of
+	// formatting (e.g. markdown bullet lists of options).
+	tail := trimmed
+	if len(tail) > 200 {
+		tail = tail[len(tail)-200:]
+	}
+	tail = strings.ToLower(tail)
+
+	questionPhrases := []string{
+		"could you clarify",
+		"can you clarify",
+		"would you like",
+		"do you want",
+		"shall i",
+		"should i",
+		"what would you",
+		"which option",
+		"please let me know",
+		"please confirm",
+		"what do you think",
+		"how would you like",
+	}
+	for _, phrase := range questionPhrases {
+		if strings.Contains(tail, phrase) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isUnrecoverableError checks whether an LLM call error is permanent and
+// should not be retried. Authentication failures, access denied responses,
+// and context length exceeded errors all fall into this category.
+func isUnrecoverableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+
+	unrecoverablePatterns := []string{
+		"authentication",
+		"auth error",
+		"unauthorized",
+		"401",
+		"403",
+		"access denied",
+		"permission denied",
+		"invalid api key",
+		"invalid_api_key",
+		"context length exceeded",
+		"context_length_exceeded",
+		"maximum context length",
+		"token limit",
+		"max tokens",
+		"rate limit", // rate limiting is often temporary, but persistent 429s are unrecoverable at session level
+	}
+	for _, pattern := range unrecoverablePatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }

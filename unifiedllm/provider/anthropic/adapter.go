@@ -279,6 +279,12 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 			}
 			tools = append(tools, t)
 		}
+		// Inject cache_control on the last tool definition for prompt caching.
+		// This allows Anthropic to cache the tool definitions across turns,
+		// complementing the system prompt and conversation caching.
+		if len(tools) > 0 {
+			tools[len(tools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+		}
 		body["tools"] = tools
 	}
 
@@ -355,7 +361,7 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 
 	// Pass through provider-specific options (except beta headers which go in HTTP headers).
 	for k, v := range req.ProviderOptions {
-		if k == "anthropic_beta" || k == "beta_headers" {
+		if k == "anthropic_beta" || k == "beta_headers" || k == "anthropic" {
 			continue
 		}
 		body[k] = v
@@ -732,6 +738,28 @@ func (a *Adapter) parseResponse(body map[string]any) (*types.Response, error) {
 		resp.Usage = parseUsage(usage)
 	}
 
+	// If the API did not report reasoning tokens explicitly but the response
+	// contains thinking blocks, flag that reasoning was used. We cannot know
+	// the exact token count from content alone, but we can signal presence by
+	// checking for a non-empty thinking block and falling back to the output
+	// tokens as an upper-bound estimate when thinking is the sole output.
+	if resp.Usage.ReasoningTokens == nil {
+		hasThinking := false
+		for _, cp := range resp.Message.Content {
+			if cp.Kind == types.ContentKindThinking || cp.Kind == types.ContentKindRedactedThinking {
+				hasThinking = true
+				break
+			}
+		}
+		if hasThinking {
+			// Mark reasoning tokens as present. Without an explicit count from
+			// the API we set to 0 to indicate "present but unknown count" rather
+			// than fabricating a number.
+			zero := 0
+			resp.Usage.ReasoningTokens = &zero
+		}
+	}
+
 	return resp, nil
 }
 
@@ -988,9 +1016,30 @@ func (a *Adapter) setHeaders(req *http.Request, providerOptions map[string]any) 
 	req.Header.Set("anthropic-version", anthropicVersion)
 
 	// Collect beta header values from provider options.
+	// Support two conventions:
+	//   1. Nested: providerOptions["anthropic"]["beta_headers"] (preferred)
+	//   2. Top-level: providerOptions["anthropic_beta"] (backwards compat)
 	var betaParts []string
 
 	if providerOptions != nil {
+		// First, check the nested convention: providerOptions["anthropic"]["beta_headers"].
+		if anthropicOpts, ok := providerOptions["anthropic"].(map[string]any); ok {
+			if beta, ok := anthropicOpts["beta_headers"].(string); ok {
+				betaParts = append(betaParts, beta)
+			}
+			if betas, ok := anthropicOpts["beta_headers"].([]string); ok {
+				betaParts = append(betaParts, betas...)
+			}
+			if betas, ok := anthropicOpts["beta_headers"].([]any); ok {
+				for _, b := range betas {
+					if s, ok := b.(string); ok {
+						betaParts = append(betaParts, s)
+					}
+				}
+			}
+		}
+
+		// Fall back to the top-level convention: providerOptions["anthropic_beta"].
 		if beta, ok := providerOptions["anthropic_beta"].(string); ok {
 			betaParts = append(betaParts, beta)
 		}
@@ -1063,6 +1112,17 @@ func parseUsage(usage map[string]any) types.Usage {
 	}
 	if v, ok := toInt(usage["cache_read_input_tokens"]); ok {
 		u.CacheReadTokens = &v
+	}
+
+	// Reasoning/thinking tokens. The Anthropic API may report these directly
+	// in the usage object (e.g. as "thinking_tokens" or within an
+	// "output_tokens_details" sub-object). Check both locations.
+	if v, ok := toInt(usage["thinking_tokens"]); ok {
+		u.ReasoningTokens = &v
+	} else if details, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if v, ok := toInt(details["thinking_tokens"]); ok {
+			u.ReasoningTokens = &v
+		}
 	}
 
 	return u

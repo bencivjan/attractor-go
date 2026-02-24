@@ -154,7 +154,13 @@ func (a *Adapter) Complete(ctx context.Context, req types.Request) (*types.Respo
 		return nil, types.NewSDKError("failed to parse response JSON", err)
 	}
 
-	return a.parseResponse(raw, req.Model)
+	result, err := a.parseResponse(raw, req.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	result.RateLimit = parseRateLimitHeaders(resp.Header)
+	return result, nil
 }
 
 // Stream sends a streaming request to the Gemini API using ?alt=sse.
@@ -1025,6 +1031,40 @@ func encodeBase64(data []byte) string {
 	return b.String()
 }
 
-// Unused import suppressor for strconv (used in other adapters, included here
-// for consistency even though Gemini doesn't use header-based rate limits).
-var _ = strconv.Itoa
+// parseRateLimitHeaders extracts rate limit information from response headers.
+// Gemini may return standard X-RateLimit-* headers when accessed through
+// proxies or API gateways.
+func parseRateLimitHeaders(headers http.Header) *types.RateLimitInfo {
+	info := &types.RateLimitInfo{}
+	hasAny := false
+
+	if v := headers.Get("X-RateLimit-Remaining-Requests"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			info.RequestsRemaining = &n
+			hasAny = true
+		}
+	}
+	if v := headers.Get("X-RateLimit-Limit-Requests"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			info.RequestsLimit = &n
+			hasAny = true
+		}
+	}
+	if v := headers.Get("X-RateLimit-Remaining-Tokens"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			info.TokensRemaining = &n
+			hasAny = true
+		}
+	}
+	if v := headers.Get("X-RateLimit-Limit-Tokens"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			info.TokensLimit = &n
+			hasAny = true
+		}
+	}
+
+	if !hasAny {
+		return nil
+	}
+	return info
+}

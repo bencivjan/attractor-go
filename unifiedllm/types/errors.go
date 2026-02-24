@@ -450,18 +450,20 @@ func ErrorFromStatusCode(statusCode int, message, provider, errorCode string, ra
 	}
 
 	switch statusCode {
+	case http.StatusBadRequest:
+		return NewInvalidRequestError(message, provider, statusCode, errorCode, raw, nil)
 	case http.StatusUnauthorized:
 		return NewAuthenticationError(message, provider, errorCode, raw, nil)
 	case http.StatusForbidden:
 		return NewAccessDeniedError(message, provider, errorCode, raw, nil)
 	case http.StatusNotFound:
 		return NewNotFoundError(message, provider, errorCode, raw, nil)
-	case http.StatusBadRequest:
-		return NewInvalidRequestError(message, provider, statusCode, errorCode, raw, nil)
-	case http.StatusUnprocessableEntity:
-		return NewInvalidRequestError(message, provider, statusCode, errorCode, raw, nil)
+	case http.StatusRequestTimeout:
+		return NewRequestTimeoutError(message, nil)
 	case http.StatusRequestEntityTooLarge:
 		return NewContextLengthError(message, provider, statusCode, errorCode, raw, nil)
+	case http.StatusUnprocessableEntity:
+		return NewInvalidRequestError(message, provider, statusCode, errorCode, raw, nil)
 	case http.StatusTooManyRequests:
 		if matchesQuotaExceeded(message) {
 			return NewQuotaExceededError(message, provider, errorCode, raw, nil)
@@ -471,7 +473,9 @@ func ErrorFromStatusCode(statusCode int, message, provider, errorCode string, ra
 		if statusCode >= 500 && statusCode < 600 {
 			return NewServerError(message, provider, statusCode, errorCode, raw, nil)
 		}
-		return NewProviderError(message, provider, statusCode, errorCode, false, retryAfter, raw, nil)
+		// Unknown errors default to retryable per spec: transient issues
+		// are more common than permanent failures from unexpected codes.
+		return NewProviderError(message, provider, statusCode, errorCode, true, retryAfter, raw, nil)
 	}
 }
 

@@ -239,7 +239,10 @@ func (a *Adapter) buildRequestBody(req types.Request, stream bool) (map[string]a
 	}
 
 	if len(systemParts) > 0 {
-		// Use array form to support cache_control annotations.
+		// Inject cache_control on the last system block for prompt caching.
+		// This allows Anthropic to cache the system prompt across turns,
+		// reducing input token costs by up to 90% for agentic workloads.
+		systemParts[len(systemParts)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
 		body["system"] = systemParts
 	}
 
@@ -409,7 +412,43 @@ func (a *Adapter) buildMessages(messages []types.Message) ([]map[string]any, err
 		}
 	}
 
+	// Inject cache_control on the last user-role message. This creates a
+	// cache breakpoint at the conversation prefix boundary, allowing all
+	// prior turns to be cached across agentic loop iterations.
+	injectConversationCacheBreakpoint(result)
+
 	return result, nil
+}
+
+// injectConversationCacheBreakpoint adds cache_control to the last content
+// block of the last user-role message. This enables Anthropic to cache the
+// entire conversation prefix up to this point.
+func injectConversationCacheBreakpoint(messages []map[string]any) {
+	// Find the last user message.
+	for i := len(messages) - 1; i >= 0; i-- {
+		role, _ := messages[i]["role"].(string)
+		if role != "user" {
+			continue
+		}
+
+		content := messages[i]["content"]
+		switch c := content.(type) {
+		case []map[string]any:
+			if len(c) > 0 {
+				c[len(c)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+		case string:
+			// Convert to array form to add cache_control.
+			messages[i]["content"] = []map[string]any{
+				{
+					"type":          "text",
+					"text":          c,
+					"cache_control": map[string]any{"type": "ephemeral"},
+				},
+			}
+		}
+		return
+	}
 }
 
 // buildUserMessage constructs an Anthropic user message.
@@ -937,25 +976,39 @@ func (a *Adapter) setHeaders(req *http.Request, providerOptions map[string]any) 
 	req.Header.Set("x-api-key", a.apiKey)
 	req.Header.Set("anthropic-version", anthropicVersion)
 
-	// Beta headers from provider options.
+	// Collect beta header values from provider options.
+	var betaParts []string
+
 	if providerOptions != nil {
 		if beta, ok := providerOptions["anthropic_beta"].(string); ok {
-			req.Header.Set("anthropic-beta", beta)
+			betaParts = append(betaParts, beta)
 		}
 		if betas, ok := providerOptions["anthropic_beta"].([]string); ok {
-			req.Header.Set("anthropic-beta", strings.Join(betas, ","))
+			betaParts = append(betaParts, betas...)
 		}
 		if betas, ok := providerOptions["anthropic_beta"].([]any); ok {
-			var parts []string
 			for _, b := range betas {
 				if s, ok := b.(string); ok {
-					parts = append(parts, s)
+					betaParts = append(betaParts, s)
 				}
 			}
-			if len(parts) > 0 {
-				req.Header.Set("anthropic-beta", strings.Join(parts, ","))
-			}
 		}
+	}
+
+	// Always enable prompt caching beta for cost optimization.
+	hasCachingBeta := false
+	for _, b := range betaParts {
+		if strings.Contains(b, "prompt-caching") {
+			hasCachingBeta = true
+			break
+		}
+	}
+	if !hasCachingBeta {
+		betaParts = append(betaParts, "prompt-caching-2024-07-31")
+	}
+
+	if len(betaParts) > 0 {
+		req.Header.Set("anthropic-beta", strings.Join(betaParts, ","))
 	}
 
 	for k, v := range a.headers {

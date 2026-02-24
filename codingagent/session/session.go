@@ -21,6 +21,7 @@ package session
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -71,6 +72,9 @@ type Config struct {
 	DefaultCommandTimeoutMs int
 	// MaxCommandTimeoutMs is the hard upper bound for shell command timeouts.
 	MaxCommandTimeoutMs int
+	// EnableStreaming enables streaming mode where the session uses
+	// LLMClient.Stream() and emits TEXT_DELTA events as tokens arrive.
+	EnableStreaming bool
 	// ReasoningEffort controls the model's reasoning depth ("low", "medium",
 	// "high", or "" for provider default).
 	ReasoningEffort string
@@ -410,47 +414,20 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 		// ---- Step 2: Build LLM request ----
 		req := s.buildRequest()
 
-		// ---- Step 3: Call LLM ----
-		s.EventEmitter.Emit(events.EventAssistantTextStart, s.ID, map[string]any{
-			"tool_round": toolRound,
-		})
+		// ---- Step 3+4: Call LLM and record assistant turn ----
+		var assistantTurn *AssistantTurn
+		var callErr error
 
-		resp, err := s.LLMClient.Complete(ctx, req)
-		if err != nil {
-			s.EventEmitter.Emit(events.EventError, s.ID, map[string]any{
-				"error":  err.Error(),
-				"source": "llm_complete",
-			})
-			return fmt.Errorf("LLM complete: %w", err)
+		if s.Config.EnableStreaming && s.Profile.SupportsStreaming() {
+			assistantTurn, callErr = s.callLLMStreaming(ctx, req, toolRound)
+		} else {
+			assistantTurn, callErr = s.callLLMBlocking(ctx, req, toolRound)
 		}
-
-		// ---- Step 4: Record assistant turn ----
-		assistantText := resp.Text()
-		toolCalls := extractToolCalls(resp)
-		reasoning := resp.Reasoning()
-
-		assistantTurn := &AssistantTurn{
-			Content:           assistantText,
-			ToolCalls:         toolCalls,
-			Reasoning:         reasoning,
-			ThinkingSignature: extractThinkingSignature(resp),
-			Usage:             resp.Usage,
-			ResponseID:        resp.ID,
-			Timestamp:         time.Now(),
+		if callErr != nil {
+			return callErr
 		}
+		toolCalls := assistantTurn.ToolCalls
 		s.History = append(s.History, assistantTurn)
-
-		if assistantText != "" {
-			s.EventEmitter.Emit(events.EventAssistantTextDelta, s.ID, map[string]any{
-				"text": assistantText,
-			})
-		}
-
-		s.EventEmitter.Emit(events.EventAssistantTextEnd, s.ID, map[string]any{
-			"usage":         resp.Usage,
-			"finish_reason": resp.FinishReason.Reason,
-			"has_tools":     len(toolCalls) > 0,
-		})
 
 		// ---- Step 5: No tool calls -> natural completion ----
 		if len(toolCalls) == 0 {
@@ -486,6 +463,174 @@ func (s *Session) processInput(ctx context.Context, input string) error {
 
 		// ---- Step 9: Continue loop ----
 	}
+}
+
+// ---------------------------------------------------------------------------
+// LLM call modes
+// ---------------------------------------------------------------------------
+
+// callLLMBlocking calls the LLM in blocking mode and emits text events after
+// the full response is received.
+func (s *Session) callLLMBlocking(ctx context.Context, req types.Request, toolRound int) (*AssistantTurn, error) {
+	resp, err := s.LLMClient.Complete(ctx, req)
+	if err != nil {
+		s.EventEmitter.Emit(events.EventError, s.ID, map[string]any{
+			"error":  err.Error(),
+			"source": "llm_complete",
+		})
+		return nil, fmt.Errorf("LLM complete: %w", err)
+	}
+
+	assistantText := resp.Text()
+	toolCalls := extractToolCalls(resp)
+	reasoning := resp.Reasoning()
+
+	turn := &AssistantTurn{
+		Content:           assistantText,
+		ToolCalls:         toolCalls,
+		Reasoning:         reasoning,
+		ThinkingSignature: extractThinkingSignature(resp),
+		Usage:             resp.Usage,
+		ResponseID:        resp.ID,
+		Timestamp:         time.Now(),
+	}
+
+	// Emit text events after response arrives.
+	s.EventEmitter.Emit(events.EventAssistantTextStart, s.ID, map[string]any{
+		"tool_round": toolRound,
+	})
+	if assistantText != "" {
+		s.EventEmitter.Emit(events.EventAssistantTextDelta, s.ID, map[string]any{
+			"text": assistantText,
+		})
+	}
+	s.EventEmitter.Emit(events.EventAssistantTextEnd, s.ID, map[string]any{
+		"usage":         resp.Usage,
+		"finish_reason": resp.FinishReason.Reason,
+		"has_tools":     len(toolCalls) > 0,
+	})
+
+	return turn, nil
+}
+
+// callLLMStreaming calls the LLM in streaming mode, emitting TEXT_DELTA events
+// as tokens arrive for real-time UI rendering (spec Section 2.9).
+func (s *Session) callLLMStreaming(ctx context.Context, req types.Request, toolRound int) (*AssistantTurn, error) {
+	ch, err := s.LLMClient.Stream(ctx, req)
+	if err != nil {
+		s.EventEmitter.Emit(events.EventError, s.ID, map[string]any{
+			"error":  err.Error(),
+			"source": "llm_stream",
+		})
+		return nil, fmt.Errorf("LLM stream: %w", err)
+	}
+
+	s.EventEmitter.Emit(events.EventAssistantTextStart, s.ID, map[string]any{
+		"tool_round": toolRound,
+		"streaming":  true,
+	})
+
+	var textBuilder strings.Builder
+	var reasoningBuilder strings.Builder
+	var accToolCalls []types.ToolCallData
+	var usage types.Usage
+	var finishReason string
+
+	// Accumulate tool call argument builders keyed by tool call ID.
+	type toolCallAccum struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+	toolCallAccums := make(map[string]*toolCallAccum)
+
+	for evt := range ch {
+		switch evt.Type {
+		case types.StreamEventTextDelta:
+			textBuilder.WriteString(evt.Delta)
+			s.EventEmitter.Emit(events.EventAssistantTextDelta, s.ID, map[string]any{
+				"text": evt.Delta,
+			})
+
+		case types.StreamEventReasoningDelta:
+			reasoningBuilder.WriteString(evt.ReasoningDelta)
+
+		case types.StreamEventToolCallStart:
+			if evt.ToolCall != nil {
+				toolCallAccums[evt.ToolCall.ID] = &toolCallAccum{
+					id:   evt.ToolCall.ID,
+					name: evt.ToolCall.Name,
+				}
+			}
+
+		case types.StreamEventToolCallDelta:
+			if evt.ToolCall != nil {
+				if acc, ok := toolCallAccums[evt.ToolCall.ID]; ok {
+					acc.args.WriteString(evt.Delta)
+				}
+			}
+
+		case types.StreamEventToolCallEnd:
+			if evt.ToolCall != nil {
+				accToolCalls = append(accToolCalls, *evt.ToolCall)
+				// Remove from accumulators.
+				delete(toolCallAccums, evt.ToolCall.ID)
+			}
+
+		case types.StreamEventFinish:
+			if evt.Usage != nil {
+				usage = *evt.Usage
+			}
+			if evt.FinishReason != nil {
+				finishReason = evt.FinishReason.Reason
+			}
+
+		case types.StreamEventError:
+			s.EventEmitter.Emit(events.EventError, s.ID, map[string]any{
+				"error":  evt.Error.Error(),
+				"source": "llm_stream",
+			})
+			return nil, fmt.Errorf("LLM stream error: %w", evt.Error)
+		}
+	}
+
+	// Finalize any partially accumulated tool calls.
+	for _, acc := range toolCallAccums {
+		var args map[string]any
+		if acc.args.Len() > 0 {
+			_ = json.Unmarshal([]byte(acc.args.String()), &args)
+		}
+		accToolCalls = append(accToolCalls, types.ToolCallData{
+			ID:        acc.id,
+			Name:      acc.name,
+			Type:      "function",
+			Arguments: args,
+		})
+	}
+
+	// Convert ToolCallData to ToolCall.
+	var toolCalls []types.ToolCall
+	for _, tcd := range accToolCalls {
+		toolCalls = append(toolCalls, types.ToolCall{
+			ID:        tcd.ID,
+			Name:      tcd.Name,
+			Arguments: tcd.Arguments,
+		})
+	}
+
+	s.EventEmitter.Emit(events.EventAssistantTextEnd, s.ID, map[string]any{
+		"usage":         usage,
+		"finish_reason": finishReason,
+		"has_tools":     len(toolCalls) > 0,
+	})
+
+	return &AssistantTurn{
+		Content:   textBuilder.String(),
+		ToolCalls: toolCalls,
+		Reasoning: reasoningBuilder.String(),
+		Usage:     usage,
+		Timestamp: time.Now(),
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -249,10 +249,10 @@ func (e *LocalEnvironment) ExecCommand(ctx context.Context, command string, time
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		}
 
-		// Give the process 5 seconds to terminate gracefully.
+		// Give the process 2 seconds to terminate gracefully per spec.
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(2 * time.Second):
 			if cmd.Process != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
@@ -518,26 +518,41 @@ func detectOSVersion() string {
 	return runtime.GOOS
 }
 
-// filterEnv removes sensitive environment variables from the inherited env.
-func filterEnv(environ []string) []string {
-	blocked := map[string]bool{
-		"AWS_SECRET_ACCESS_KEY": true,
-		"AWS_SESSION_TOKEN":    true,
-		"OPENAI_API_KEY":       true,
-		"ANTHROPIC_API_KEY":    true,
-		"GOOGLE_API_KEY":       true,
-		"GITHUB_TOKEN":         true,
-	}
+// sensitiveEnvSuffixes lists the suffix patterns that identify environment
+// variables likely to contain secrets. Matching is case-insensitive per spec.
+var sensitiveEnvSuffixes = []string{
+	"_API_KEY",
+	"_SECRET",
+	"_TOKEN",
+	"_PASSWORD",
+	"_CREDENTIAL",
+}
 
+// filterEnv removes sensitive environment variables from the inherited env.
+// Variables whose names end with any of the sensitive suffixes (case-insensitive)
+// are excluded.
+func filterEnv(environ []string) []string {
 	var filtered []string
 	for _, e := range environ {
 		key, _, ok := strings.Cut(e, "=")
-		if ok && blocked[key] {
+		if ok && isSensitiveEnvVar(key) {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
 	return filtered
+}
+
+// isSensitiveEnvVar reports whether the given variable name matches any of the
+// sensitive suffix patterns.
+func isSensitiveEnvVar(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, suffix := range sensitiveEnvSuffixes {
+		if strings.HasSuffix(upper, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // globToRegex converts a glob pattern with ** support to a regular expression.
